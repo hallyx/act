@@ -34,20 +34,24 @@ def main(args):
     num_epochs = args['num_epochs']
 
     # get task parameters
-    is_sim = task_name[:4] == 'sim_'
-    if is_sim:
-        from constants import SIM_TASK_CONFIGS
-        task_config = SIM_TASK_CONFIGS[task_name]
-    else:
-        from aloha_scripts.constants import TASK_CONFIGS
-        task_config = TASK_CONFIGS[task_name]
+    is_sim = 'True'
+    from constants import SIM_TASK_CONFIGS
+    
+    # 不管任务名叫什么，都从本地 SIM_TASK_CONFIGS 里读
+    task_config = SIM_TASK_CONFIGS[args['task_name']]
+    #if is_sim:
+    #    from constants import SIM_TASK_CONFIGS
+    #    task_config = SIM_TASK_CONFIGS[task_name]
+    #else:
+    #    from aloha_scripts.constants import TASK_CONFIGS
+    #    task_config = TASK_CONFIGS[task_name]
     dataset_dir = task_config['dataset_dir']
     num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
 
     # fixed parameters
-    state_dim = 14
+    state_dim = 8
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -65,10 +69,11 @@ def main(args):
                          'dec_layers': dec_layers,
                          'nheads': nheads,
                          'camera_names': camera_names,
+                         'state_dim' :state_dim
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names,}
+                         'camera_names': camera_names,'state_dim':state_dim}
     else:
         raise NotImplementedError
 
@@ -315,9 +320,12 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 def forward_pass(data, policy):
     image_data, qpos_data, action_data, is_pad = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
-
+    # === 修改：强制加 .float() 转换数据类型 ===
+    image_data = image_data.cuda().float()
+    qpos_data = qpos_data.cuda().float()   # <--- 关键修改：转为 float32
+    action_data = action_data.cuda().float() # <--- 保险起见，这也加上
+    is_pad = is_pad.cuda()
+    return policy(qpos_data, image_data, action_data, is_pad)
 
 def train_bc(train_dataloader, val_dataloader, config):
     num_epochs = config['num_epochs']

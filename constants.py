@@ -1,7 +1,7 @@
 import pathlib
-
+import numpy as np
 ### Task parameters
-DATA_DIR = '<put your data dir here>'
+DATA_DIR = './data'
 SIM_TASK_CONFIGS = {
     'sim_transfer_cube_scripted':{
         'dataset_dir': DATA_DIR + '/sim_transfer_cube_scripted',
@@ -29,6 +29,17 @@ SIM_TASK_CONFIGS = {
         'num_episodes': 50,
         'episode_len': 500,
         'camera_names': ['top']
+    },
+    'astrobench_dual_arm': {
+        # 你的数据根目录 (请确保路径正确)
+        'dataset_dir': '/home/gpuserver/hx/github/act/data', 
+        # 这里的 num_episodes 主要用于 dataloader 里的划分参考
+        # 实际上我们的新 load_data 会自动读取所有文件，但保持一致比较好
+        'num_episodes': 100, 
+        # 你的每一集大概有多少帧？这个参数目前主要用于参考，不影响核心训练
+        'episode_len': 110, 
+        # 必须和你 HDF5 文件里的相机键名完全一致！
+        'camera_names': ['rgb_main', 'rgb_left', 'rgb_under'] 
     },
 }
 
@@ -74,3 +85,12 @@ PUPPET_POS2JOINT = lambda x: PUPPET_GRIPPER_POSITION_NORMALIZE_FN(x) * (PUPPET_G
 PUPPET_JOINT2POS = lambda x: PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN((x - PUPPET_GRIPPER_JOINT_CLOSE) / (PUPPET_GRIPPER_JOINT_OPEN - PUPPET_GRIPPER_JOINT_CLOSE))
 
 MASTER_GRIPPER_JOINT_MID = (MASTER_GRIPPER_JOINT_OPEN + MASTER_GRIPPER_JOINT_CLOSE)/2
+
+DATA_STATS = {
+    'asteobench_left_arm':{
+        'action_mean': np.array([0.55030, -0.98194, -0.16345, 1.63764, 0.05051, -0.92116, -0.16856, 0.09615]),
+        'action_std': np.array([0.38864, 0.45182, 0.12031, 0.36915, 0.07570, 0.14166, 0.16344, 0.29483]),
+        'qpos_mean': np.array([0.54876, -0.98033, -0.16305, 1.63949, 0.05046, -0.92169, -0.16818]),
+        'qpos_std': np.array([0.38896, 0.45181, 0.12044, 0.36909, 0.07564, 0.14132, 0.16344]),
+    }
+}
