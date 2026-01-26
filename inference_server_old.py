@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-import os
-
-# === 必须在任何 torch 或 omni 模块导入之前设置！===
-# 这将限制当前进程只看得到物理上的 GPU 1
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-
 import torch
 import numpy as np
 import os
@@ -57,8 +50,7 @@ class ACTInferenceServer:
             'lr': 1e-5, 'num_queries': 50, 'kl_weight': 10, 'hidden_dim': 512, 'dim_feedforward': 3200,
             'lr_backbone': 1e-5, 'backbone': 'resnet18', 'enc_layers': 4, 'dec_layers': 7, 'nheads': 8,
             'camera_names': self.camera_names,
-            'state_dim': 17,  # 基座位置(3) + 基座速度(6) + 关节位置(8) = 17维
-            'action_dim': 16  # 关节位置(7) + 夹爪(1) + 关节速度(7) + 夹爪速度(1) = 16维
+            'state_dim': 8  # <--- 你的 8 维状态
         }
         
         # 使用本地定义的 make_policy
@@ -74,27 +66,15 @@ class ACTInferenceServer:
 
         # 3. 初始化时间聚合 (Temporal Aggregation) 缓冲区
         self.chunk_size = policy_config['num_queries'] # 50
-        self.state_dim = policy_config['state_dim']    # 17
-        self.action_dim = policy_config['action_dim']  # 16
+        self.state_dim = policy_config['state_dim']    # 8
         self.max_timesteps = 1000 # 预设一个最大步数，用于buffer
         
-        # 存储时间聚合的动作，使用 action_dim 维度
-        self.all_time_actions = torch.zeros([
-            self.max_timesteps,
-            self.max_timesteps + self.chunk_size,
-            self.action_dim
-        ]).cuda()
+        self.all_time_actions = torch.zeros([self.max_timesteps, self.max_timesteps + self.chunk_size, self.state_dim]).cuda()
         self.t = 0 # 当前时间步
 
     def pre_process(self, qpos_numpy):
-        # 归一化 qpos，确保维度正确
-        qpos_arr = np.asarray(qpos_numpy, dtype=np.float32)
-        if qpos_arr.shape[-1] != self.state_dim:
-            raise ValueError(
-                f"Expected qpos dim {self.state_dim}, but got {qpos_arr.shape[-1]}. "
-                "Please send base_pos(3)+base_vel(6)+joint_pos(7)+gripper(1)."
-            )
-        return (qpos_arr - self.stats['qpos_mean']) / self.stats['qpos_std']
+        # 归一化 qpos
+        return (qpos_numpy - self.stats['qpos_mean']) / self.stats['qpos_std']
 
     def post_process(self, action_numpy):
         # 反归一化 action
@@ -102,14 +82,14 @@ class ACTInferenceServer:
 
     def predict(self, qpos, images):
         """
-        qpos: (17,) numpy array [base_pos(3) + base_vel(6) + joint_pos(7) + gripper(1)]
+        qpos: (8,) numpy array
         images: dict of (480, 640, 3) numpy arrays
         """
         with torch.inference_mode():
             # === 数据预处理 ===
             # 1. 处理 QPOS
             qpos_norm = self.pre_process(qpos)
-            qpos_tensor = torch.from_numpy(qpos_norm).float().cuda().unsqueeze(0) # (1, 17)
+            qpos_tensor = torch.from_numpy(qpos_norm).float().cuda().unsqueeze(0) # (1, 8)
             
             # 2. 处理图像
             curr_images = []
@@ -121,7 +101,7 @@ class ACTInferenceServer:
             image_tensor = torch.from_numpy(curr_image_stack / 255.0).float().cuda().unsqueeze(0) # (1, num_cam, C, H, W)
 
             # === 模型推理 ===
-            all_actions = self.policy(qpos_tensor, image_tensor) # (1, chunk_size, action_dim)
+            all_actions = self.policy(qpos_tensor, image_tensor) # (1, chunk_size, 8)
             
             # === 时间聚合 (核心逻辑) ===
             self.all_time_actions[[self.t], self.t : self.t + self.chunk_size] = all_actions

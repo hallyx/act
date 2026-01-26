@@ -75,24 +75,27 @@ class EpisodicDataset(torch.utils.data.Dataset):
             else:
                 start_ts = np.random.choice(episode_len)
             
-            # 4. 获取 QPOS (当前机器人状态)
+            # 4. 获取基座位置和速度
+            base_pose = root['/observations/base_pose'][start_ts]  # (7,) [pos(3) + quat(4)]
+            base_pos = base_pose[:3]  # 只取位置 (3,)
+            base_vel = root['/observations/base_vel'][start_ts]  # (6,) [linear(3) + angular(3)]
+            
+            # 5. 获取 QPOS (当前机器人状态)
             # 你的数据里是 joint_pos (28维), 通常 ACT 需要包含夹爪状态
             # 如果 observation 里没有存夹爪状态，我们暂时只取关节
             full_qos = root['/observations/joint_pos'][start_ts] # (28,)
             q_left_index = [0,2,4,6,8,10,12]  # 左臂关节索引，后续7个是夹爪
             q_right_index = [1,3,5,7,9,11,13] # 右臂关节索引
             qpos_gripper = np.array([0.0]) 
-            qpos = np.concatenate([full_qos[q_left_index], qpos_gripper]) #  8 维
+            joint_qpos = np.concatenate([full_qos[q_left_index], qpos_gripper])  # 8 维
             
-            # 5. 获取 QVEL (速度)
-            # 如果你的数据里没有 velocity，可以用全 0 替代
-            if '/observations/base_vel' in root:
-                # 注意维度匹配，这里仅作示例
-                qvel = root['/observations/base_vel'][start_ts] 
-            else:
-                qvel = np.zeros_like(qpos) 
+            # 组合: 基座位置(3) + 基座速度(6) + 关节位置(8) = 17维
+            qpos = np.concatenate([base_pos, base_vel, joint_qpos])
+            
+            # 6. 获取 QVEL (速度) - 暂时不使用，保留接口
+            qvel = np.zeros_like(qpos) 
 
-            # 6. 获取图像 (核心修改: 解码 JPEG/PNG)
+            # 7. 获取图像 (核心修改: 解码 JPEG/PNG)
             image_dict = dict()
             for cam_name in self.camera_names:
                 # 读取字节流
@@ -102,18 +105,27 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 # 转换: BGR -> RGB
                 image_dict[cam_name] = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-            # 7. 获取动作 Action (合并关节和夹爪)
-            # 你的 Action 是分开存的，需要合并
-            action_joints_full = root['/action/joint_positions'][start_ts:]
-            action_joints = action_joints_full[:, q_left_index]
+            # 8. 获取动作 Action (合并关节位置、速度和夹爪)
+            # 位置
+            action_joints_pos_full = root['/action/joint_positions'][start_ts:]
+            action_joints_pos = action_joints_pos_full[:, q_left_index]  # (T, 7)
             action_gripper_full = root['/action/gripper_command'][start_ts:]
-            action_gripper = action_gripper_full[:, 0:1] # 只取左臂夹爪
-            action = np.concatenate([action_joints, action_gripper], axis=-1) # (T, 30)
+            action_gripper = action_gripper_full[:, 0:1]  # 只取左臂夹爪 (T, 1)
+            
+            # 速度
+            action_joints_vel_full = root['/action/joint_velocities'][start_ts:]
+            action_joints_vel = action_joints_vel_full[:, q_left_index]  # (T, 7)
+            # 夹爪速度（如果没有单独的夹爪速度数据，可以设为0或从gripper_command计算差分）
+            action_gripper_vel = np.zeros((action_gripper.shape[0], 1), dtype=np.float32)  # (T, 1)
+            
+            # 组合: joint_pos(7) + gripper(1) + joint_vel(7) + gripper_vel(1) = 16
+            action = np.concatenate([action_joints_pos, action_gripper, 
+                                    action_joints_vel, action_gripper_vel], axis=-1)  # (T, 16)
             
             action_len = episode_len - start_ts
 
         # 构造 Padding
-        # 注意: action.shape[-1] 应该是 8 (7关节 + 1夹爪)
+        # 注意: action.shape[-1] 应该是 16 (7关节位置 + 1夹爪 + 7关节速度 + 1夹爪速度)
         padded_action = np.zeros((original_action_shape[0], action.shape[-1]), dtype=np.float32)
         padded_action[:action_len] = action
         is_pad = np.zeros(episode_len)
@@ -154,16 +166,34 @@ def get_norm_stats(file_paths, num_episodes): # <--- 接收路径列表
 
     for file_path in paths_to_process:
         with h5py.File(file_path, 'r') as root:
+            # 读取基座位置和速度
+            base_pose = root['/observations/base_pose'][()]  # (T, 7)
+            base_pos = base_pose[:, :3]  # (T, 3) 只取位置
+            base_vel = root['/observations/base_vel'][()]  # (T, 6)
+            
+            # 读取关节位置
             full_qpos = root['/observations/joint_pos'][()]
             q_left_index = [0,2,4,6,8,10,12]  # 左臂关节索引，后续7个是夹爪
             q_pos_gripper = np.zeros((full_qpos.shape[0], 1))
-            qpos = np.concatenate([full_qpos[:, q_left_index], q_pos_gripper],axis=1)
+            joint_qpos = np.concatenate([full_qpos[:, q_left_index], q_pos_gripper], axis=1)
+            
+            # 组合: 基座位置(3) + 基座速度(6) + 关节位置(8) = 17维
+            qpos = np.concatenate([base_pos, base_vel, joint_qpos], axis=1)
 
-            action_joints_full = root['/action/joint_positions'][()]
-            action_joints = action_joints_full[:, q_left_index]
+            # 位置
+            action_joints_pos_full = root['/action/joint_positions'][()]
+            action_joints_pos = action_joints_pos_full[:, q_left_index]  # (T, 7)
             action_gripper_full = root['/action/gripper_command'][()]
-            action_gripper = action_gripper_full[:, 0:1] # 只取左臂夹爪
-            action = np.concatenate([action_joints, action_gripper], axis=-1)
+            action_gripper = action_gripper_full[:, 0:1]  # 只取左臂夹爪 (T, 1)
+            
+            # 速度
+            action_joints_vel_full = root['/action/joint_velocities'][()]
+            action_joints_vel = action_joints_vel_full[:, q_left_index]  # (T, 7)
+            action_gripper_vel = np.zeros((action_gripper.shape[0], 1), dtype=np.float32)  # (T, 1)
+            
+            # 组合: joint_pos(7) + gripper(1) + joint_vel(7) + gripper_vel(1) = 16
+            action = np.concatenate([action_joints_pos, action_gripper,
+                                    action_joints_vel, action_gripper_vel], axis=-1)
             
         all_qpos_data.append(torch.from_numpy(qpos))
         all_action_data.append(torch.from_numpy(action))

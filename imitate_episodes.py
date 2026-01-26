@@ -51,7 +51,8 @@ def main(args):
     camera_names = task_config['camera_names']
 
     # fixed parameters
-    state_dim = 8
+    state_dim = 17  # 基座位置(3) + 基座速度(6) + 关节位置(8) = 17维
+    action_dim = 16  # 关节位置(7) + 夹爪(1) + 关节速度(7) + 夹爪速度(1) = 16维
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -69,11 +70,12 @@ def main(args):
                          'dec_layers': dec_layers,
                          'nheads': nheads,
                          'camera_names': camera_names,
-                         'state_dim' :state_dim
+                         'state_dim': state_dim,
+                         'action_dim': action_dim
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names,'state_dim':state_dim}
+                         'camera_names': camera_names, 'state_dim': state_dim, 'action_dim': action_dim}
     else:
         raise NotImplementedError
 
@@ -82,6 +84,7 @@ def main(args):
         'ckpt_dir': ckpt_dir,
         'episode_len': episode_len,
         'state_dim': state_dim,
+        'action_dim': action_dim,
         'lr': args['lr'],
         'policy_class': policy_class,
         'onscreen_render': onscreen_render,

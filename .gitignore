@@ -140,3 +140,4 @@ dmypy.json
 .pyre/
 
 ckpt/
+ckpt_ja/
