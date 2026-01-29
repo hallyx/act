@@ -141,3 +141,7 @@ dmypy.json
 
 ckpt/
 ckpt_ja/
+ckpt_all/
+ckpt_ik/
+
+data_ja/

@@ -22,6 +22,7 @@ import IPython
 e = IPython.embed
 
 def main(args):
+    #os.environ["CUDA_VISIBLE_DEVICES"] = "1" # 指定使用 GPU 1,第二张卡，不需要时注释掉
     set_seed(1)
     # command line parameters
     is_eval = args['eval']
