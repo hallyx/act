@@ -71,12 +71,19 @@ To train ACT:
     
     # Transfer Cube task
     python3 imitate_episodes.py \
-    --task_name sim_transfer_cube_scripted \
-    --ckpt_dir ./ckpt \
-    --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
+    --task_name astrobench_dual_arm \
+    --ckpt_dir ./ckpt_ja_aura \
+    --policy_class ACT --kl_weight 10 --chunk_size 50 --hidden_dim 512 --batch_size 24 --dim_feedforward 3200 \
     --num_epochs 2000  --lr 1e-5 \
     --seed 0
-    --dataset_dir ./data/aura_k1
+
+    python3 imitate_episodes.py \
+    --task_name astrobench_dual_arm \
+    --ckpt_dir ./ckpt_ja_20 \
+    --policy_class ACT --kl_weight 0.1 --chunk_size 20 --hidden_dim 512 --batch_size 24 --dim_feedforward 3200 \
+    --num_epochs 3000  --lr 5e-6 \
+    --seed 0
+    --dataset_dir ./data_ja
 
 
 To evaluate the policy, run the same command but add ``--eval``. This loads the best validation checkpoint.

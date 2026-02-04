@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
+import gc
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
@@ -33,7 +34,8 @@ def main(args):
     batch_size_train = args['batch_size']
     batch_size_val = args['batch_size']
     num_epochs = args['num_epochs']
-
+    num_obs = args.get('num_obs', 1)  # 获取观测窗口大小，默认为1
+    
     # get task parameters
     is_sim = 'True'
     from constants import SIM_TASK_CONFIGS
@@ -52,7 +54,7 @@ def main(args):
     camera_names = task_config['camera_names']
 
     # fixed parameters
-    state_dim = 17  # 基座位置(3) + 基座速度(6) + 关节位置(8) = 17维
+    state_dim = 21  # 基座位置(3) + 基座速度(6) + 关节位置(8) = 17维
     action_dim = 16  # 关节位置(7) + 夹爪(1) + 关节速度(7) + 夹爪速度(1) = 16维
     lr_backbone = 1e-5
     backbone = 'resnet18'
@@ -109,7 +111,7 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
+    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, chunk_size=args['chunk_size'], num_obs=num_obs)
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -156,6 +158,9 @@ def get_image(ts, camera_names):
     curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
     return curr_image
 
+def count_parameters(model):
+    # 计算所有 requires_grad=True 的参数（即参与训练的参数）
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def eval_bc(config, ckpt_name, save_episode=True):
     set_seed(1000)
@@ -174,6 +179,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
+    #total_params = count_parameters(policy)
+    #print(f"Model Size: {total_params / 1e6:.2f}M parameters")
     loading_status = policy.load_state_dict(torch.load(ckpt_path))
     print(loading_status)
     policy.cuda()
@@ -324,11 +331,21 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 def forward_pass(data, policy):
     image_data, qpos_data, action_data, is_pad = data
+    
     # === 修改：强制加 .float() 转换数据类型 ===
     image_data = image_data.cuda().float()
     qpos_data = qpos_data.cuda().float()   # <--- 关键修改：转为 float32
     action_data = action_data.cuda().float() # <--- 保险起见，这也加上
     is_pad = is_pad.cuda()
+
+    # 处理新的数据格式：从 (batch, num_obs, num_cam, C, H, W) -> (batch, num_cam, C, H, W)
+    #                  和 (batch, num_obs, state_dim) -> (batch, state_dim)
+    # 当 num_obs=1 时，squeeze 掉 num_obs 维度以保持向后兼容性
+    if image_data.ndim == 6:
+        image_data = image_data.squeeze(1)  # (batch, num_cam, C, H, W)
+    if qpos_data.ndim == 3:
+        qpos_data = qpos_data.squeeze(1)    # (batch, state_dim)
+        
     return policy(qpos_data, image_data, action_data, is_pad)
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -357,6 +374,10 @@ def train_bc(train_dataloader, val_dataloader, config):
             for batch_idx, data in enumerate(val_dataloader):
                 forward_dict = forward_pass(data, policy)
                 epoch_dicts.append(forward_dict)
+                # 清理中间变量减少内存占用
+                del data
+                if batch_idx % 50 == 0:  # 每50个batch清理一次
+                    torch.cuda.empty_cache()
             epoch_summary = compute_dict_mean(epoch_dicts)
             validation_history.append(epoch_summary)
 
@@ -364,6 +385,9 @@ def train_bc(train_dataloader, val_dataloader, config):
             if epoch_val_loss < min_val_loss:
                 min_val_loss = epoch_val_loss
                 best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
+            # 清理验证阶段的内存
+            del epoch_dicts
+            torch.cuda.empty_cache()
         print(f'Val loss:   {epoch_val_loss:.5f}')
         summary_string = ''
         for k, v in epoch_summary.items():
@@ -381,6 +405,10 @@ def train_bc(train_dataloader, val_dataloader, config):
             optimizer.step()
             optimizer.zero_grad()
             train_history.append(detach_dict(forward_dict))
+            # 清理中间变量
+            del data, forward_dict, loss
+            if batch_idx % 100 == 0:  # 每100个batch清理一次
+                torch.cuda.empty_cache()
         epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
         print(f'Train loss: {epoch_train_loss:.5f}')
@@ -388,6 +416,10 @@ def train_bc(train_dataloader, val_dataloader, config):
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
+        
+        # 每个epoch结束后强制垃圾回收
+        gc.collect()
+        torch.cuda.empty_cache()
 
         if epoch % 100 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
@@ -438,10 +470,11 @@ if __name__ == '__main__':
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
 
     # for ACT
-    parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
+    parser.add_argument('--kl_weight', action='store', type=float, help='KL Weight', required=False)
     parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    parser.add_argument('--num_obs', action='store', type=int, default=1, help='num_obs', required=False)
     
     main(vars(parser.parse_args()))

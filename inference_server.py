@@ -22,7 +22,7 @@ from policy import ACTPolicy
 
 # === 配置区域 ===
 PORT = "5555"
-CKPT_DIR = './ckpt_all' # 你的模型权重路径
+CKPT_DIR = './ckpt_ik' # 你的模型权重路径
 TASK_NAME = 'astrobench_dual_arm'
 
 # 相机配置（必须和客户端 run_client.py 中的 key 匹配！）
@@ -62,11 +62,13 @@ class ACTInferenceServer:
         #   这里假设 state_dim 是 17 (和你原来的代码一致)
         policy_config = {
             'lr': 1e-5, 
-            'num_queries': 50, # chunk size
-            'kl_weight': 10, 
+            #'num_queries': 20, # chunk size
+            #'kl_weight': 0.10, 
+            'num_queries': 50,
+            'kl_weight': 10,
             'hidden_dim': 512, 
             'dim_feedforward': 3200,
-            'lr_backbone': 1e-5, 
+            'lr_backbone': 5e-6, 
             'backbone': 'resnet18', 
             'enc_layers': 4, 
             'dec_layers': 7, 

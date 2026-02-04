@@ -143,5 +143,12 @@ ckpt/
 ckpt_ja/
 ckpt_all/
 ckpt_ik/
+ckpt_ja_20/
+ckpt_ja_aura/
+ckpt_ik_aura/
+ckpt_all_aura/
+ckpt_ik_hubble/
+ckpt_ik_edit_err
 
 data_ja/
+data_ik/
