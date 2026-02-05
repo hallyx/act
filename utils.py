@@ -4,12 +4,35 @@ import os
 import h5py
 from torch.utils.data import TensorDataset, DataLoader
 import cv2
+import time
+from collections import defaultdict
 
 import IPython
 e = IPython.embed
 
 import glob
 from functools import lru_cache
+
+# 全局计时器统计
+TIMING_STATS = defaultdict(lambda: {"count": 0, "total_time": 0.0})
+
+def log_timing(name, elapsed_time):
+    """记录计时统计"""
+    TIMING_STATS[name]["count"] += 1
+    TIMING_STATS[name]["total_time"] += elapsed_time
+
+def print_timing_stats():
+    """打印计时统计信息"""
+    print("\n" + "="*60)
+    print("⏱️  性能分析统计")
+    print("="*60)
+    sorted_stats = sorted(TIMING_STATS.items(), key=lambda x: x[1]["total_time"], reverse=True)
+    for name, stats in sorted_stats:
+        avg_time = stats["total_time"] / stats["count"] if stats["count"] > 0 else 0
+        print(f"{name:40s} | 总计: {stats['total_time']:8.2f}s | "
+              f"调用: {stats['count']:6d}次 | 平均: {avg_time*1000:7.2f}ms")
+    print("="*60 + "\n")
+
 @lru_cache(maxsize=1000) # 缓存最近使用的 1000 帧解码图像
 
 def find_all_hdf5(dataset_dir):
@@ -41,139 +64,151 @@ def find_all_hdf5(dataset_dir):
 class EpisodicDataset(torch.utils.data.Dataset):
     def __init__(self, file_paths, camera_names, norm_stats, num_obs, num_action):
         super(EpisodicDataset, self).__init__()
-        self.file_paths = file_paths
-        self.camera_names = camera_names
-        self.norm_stats = norm_stats
         self.num_obs = num_obs
         self.num_action = num_action
-        self.is_sim = True # 默认为仿真
-        # --- 新增：扫描所有轨迹，生成样本索引映射 ---
-        self.samples = []
-        self.indices = []
-        self.files_cache = {} # 文件句柄缓存
-        print(f"Indexing {len(file_paths)} episodes...")
-        for path in file_paths:
+        self.camera_names = camera_names
+        self.norm_stats = norm_stats
+        self.is_sim = True
+        
+        # === 核心优化：内存数据仓库 ===
+        # 我们不存 h5py 对象，而是把数据读入 RAM
+        # 但对于图像，我们只存 "bytes" (压缩数据)，不解码，以节省内存
+        self.episode_data = [] 
+        self.samples = [] 
+        
+        print(f"Loading {len(file_paths)} episodes to RAM (Images kept as bytes)...")
+        
+        q_left_index = [0, 2, 4, 6, 8, 10, 12] # 左臂关节索引
+
+        for ep_i, path in enumerate(file_paths):
             with h5py.File(path, 'r') as root:
-                # 获取该轨迹的总步数 T
-                T = root['/action/joint_positions'].shape[0]
-                # 参考 space_dataset 逻辑：每个 cur_idx 作为一个样本的“当前步”
-                # 如果要预测下一步开始的动作，通常 cur_idx 遍历到 T-2
-                for cur_idx in range(T - 1):
-                    self.samples.append((path, cur_idx))
-        print(f"Total samples indexed: {len(self.samples)}")
-    
+                # 1. 读取基础数据
+                # 注意：这里我们直接处理好 qpos 和 action 的维度，避免在 getitem 里重复切片
+                
+                # --- QPOS 处理 (21维) ---
+                base_pose = root['/observations/base_pose'][()]
+                base_vel = root['/observations/base_vel'][()]
+                full_qpos = root['/observations/joint_pos'][()]
+                T = full_qpos.shape[0]
+                
+                # 构造 joint_qpos (8维: 7关节 + 1夹爪)
+                # 假设 sim 数据中 joint_pos 是 14 维，我们需要取左臂
+                # 如果你的数据结构不同，请检查这里的维度
+                joint_qpos_left = full_qpos[:, q_left_index]
+                # 模拟数据通常夹爪需要单独处理，这里假设追加一个 0 或者从某处读取
+                # 你的原始代码中是: qpos_gripper = np.array([0.0])，这里我们在 batch 维度构造
+                gripper_pad = np.zeros((T, 1), dtype=np.float32) 
+                
+                qpos_data = np.concatenate([joint_qpos_left, gripper_pad, base_pose, base_vel], axis=1).astype(np.float32)
+
+                # --- Action 处理 (16维) ---
+                action_pos_full = root['/action/joint_positions'][()]
+                action_vel_full = root['/action/joint_velocities'][()]
+                action_gripper_full = root['/action/gripper_command'][()]
+                
+                action_pos = action_pos_full[:, q_left_index]
+                action_vel = action_vel_full[:, q_left_index]
+                action_gripper = action_gripper_full[:, 0:1] # 取第一维
+                action_gripper_vel = np.zeros((T, 1), dtype=np.float32)
+                
+                action_data = np.concatenate([action_pos, action_gripper, action_vel, action_gripper_vel], axis=1).astype(np.float32)
+
+                # --- 图像 Bytes 读取 ---
+                # 关键：只读 bytes，不解码
+                image_bytes_dict = {}
+                for cam in camera_names:
+                    # h5py 读取出的通常是 numpy 数组格式的 bytes
+                    image_bytes_dict[cam] = root[f'observations/{cam}'][()]
+
+                # 存入列表
+                self.episode_data.append({
+                    'qpos': qpos_data,
+                    'action': action_data,
+                    'images': image_bytes_dict,
+                    'len': T
+                })
+
+                # --- 建立索引 ---
+                # 遍历 T-1 步 (根据你的逻辑)
+                for t in range(T - 1):
+                    self.samples.append((ep_i, t))
+
+        print(f"Loaded {len(self.samples)} samples. Ready for training.")
+
+    @staticmethod
+    @lru_cache(maxsize=3000) # 缓存 3000 张图，足够覆盖 num_workers * batch_size * num_obs
+    def _cached_decode(img_bytes_raw):
+        """
+        静态方法 + LRU 缓存
+        必须接收 bytes 类型 (hashable)，不能接收 numpy array
+        """
+        nparr = np.frombuffer(img_bytes_raw, np.uint8)
+        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     def __len__(self):
-        return len(self.samples) # <--- 修改这里
-    
-    @lru_cache(maxsize=1000) # 缓存最近使用的 1000 帧解码图像
-    def _decode_image(img_bytes):
-        return cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        return len(self.samples)
 
-    # 在 __getitem__ 中调用
-    
     def __getitem__(self, index):
-        file_path, cur_idx = self.samples[index]
-        # 2. 优化：文件句柄缓存 (LRU Cache 简单版)
-        if file_path not in self.files_cache:
-            # 这里的 swmr=True 很重要，允许单写多读，且更稳定
-            self.files_cache[file_path] = h5py.File(file_path, 'r', swmr=True, libver='latest')
-        
-        root = self.files_cache[file_path]
-        # with h5py.File(file_path, 'r') as root:
-            # 1. 确定 Observation 索引 (观测窗口)
-            # 如果 cur_idx 不够取 num_obs 帧，则用第一帧填充前面
+        ep_idx, cur_idx = self.samples[index]
+        data = self.episode_data[ep_idx]
+        T = data['len']
+
+        # 1. 确定 Observation 窗口索引
+        # 如果 cur_idx < num_obs, 用第一帧填充
         obs_ids = []
         for i in range(self.num_obs):
             t = max(0, cur_idx - (self.num_obs - 1) + i)
             obs_ids.append(t)
 
-        # 2. 确定 Action 索引 (预测窗口)
-        # 从 cur_idx 或 cur_idx + 1 开始取未来 num_action 帧
-        # 如果后面步数不够，用最后一帧填充
-        act_start = cur_idx # 如果你想预测包含当前帧开始，设为 cur_idx；如果从下一帧开始，设为 cur_idx + 1
+        # 2. 确定 Action 预测窗口索引
+        act_start = cur_idx # 包含当前帧
         action_ids = []
-        T = root['/action/joint_positions'].shape[0]
-        for i in range(self.num_action):
-            t = min(T - 1, act_start + i)
-            action_ids.append(t)
-            
-        # 标记哪些 action 分步是填充的（Padding Mask）
         is_pad = np.zeros(self.num_action, dtype=bool)
-        for i, t in enumerate(action_ids):
-            if act_start + i >= T:
+        for i in range(self.num_action):
+            t = act_start + i
+            if t >= T:
+                t = T - 1
                 is_pad[i] = True
+            action_ids.append(t)
 
-        # 3. 读取并处理 QPOS (观测状态)
-        # 我们取观测窗口内每一帧的状态
-        q_left_index = [0,2,4,6,8,10,12]
-        all_qpos = []
-        for t in obs_ids:
-            base_pose = root['/observations/base_pose'][t]
-            base_pos = base_pose[:3]
-            base_vel = root['/observations/base_vel'][t]
-            full_qos = root['/observations/joint_pos'][t]
-            qpos_gripper = np.array([0.0])
-            joint_qpos = np.concatenate([full_qos[q_left_index], qpos_gripper])
-            qpos_t = np.concatenate([joint_qpos, base_pos, base_pose[3:7], base_vel])
-            all_qpos.append(qpos_t)
-        qpos_data = np.stack(all_qpos, axis=0) # (num_obs, state_dim)
-
-        # 4. 读取图像
-        # 结果形状: (num_obs, num_cam, C, H, W)
-        # 读取 images (最耗时部分)
-        all_imgs = []
-        for cam in self.camera_names:
-            # 优化：只读取需要的帧
-            # h5py 读取 bytes 是很快的，耗时在 decode
-            img_bytes_seq = root[f'observations/{cam}'][obs_ids]  # (num_obs, )
-            
-            cam_imgs = []
-            for img_bytes in img_bytes_seq:
-                img = self._decode_image(img_bytes)
-                cam_imgs.append(img)
-                #img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-                #cam_imgs.append(img)
-            all_imgs.append(np.stack(cam_imgs)) # (num_obs, H, W, 3)
-            
-
-        image_data = np.stack(all_imgs, axis=1) # (num_obs, num_cam, H, W, 3)
-
-        # 5. 读取动作 Action
-        # 先用 [:] 读取完整数组，避免 h5py fancy indexing 的 increasing order 限制
-        action_joints_pos_full = root['/action/joint_positions'][:]  # (T, 14)
-        action_gripper_full = root['/action/gripper_command'][:]      # (T, 2)
-        action_joints_vel_full = root['/action/joint_velocities'][:]  # (T, 14)
-            
-        # 再用列表索引
-        action_joints_pos = action_joints_pos_full[action_ids][:, q_left_index]  # (num_action, 7)
-        action_gripper = action_gripper_full[action_ids][:, 0:1]                  # (num_action, 1)
-        action_joints_vel = action_joints_vel_full[action_ids][:, q_left_index]  # (num_action, 7)
-        action_gripper_vel = np.zeros((len(action_ids), 1), dtype=np.float32)    # (num_action, 1)
-            
-        action_data = np.concatenate([action_joints_pos, action_gripper, 
-                                     action_joints_vel, action_gripper_vel], axis=-1)
-
-        # 6. 转为 Tensor 并归一化
-        image_data = torch.from_numpy(image_data).float() / 255.0
-        # 调整图像维度: (num_obs, num_cam, H, W, 3) -> (num_obs, num_cam, 3, H, W)
-        image_data = torch.einsum('t k h w c -> t k c h w', image_data)
-        
-        qpos_data = torch.from_numpy(qpos_data).float()
-        action_data = torch.from_numpy(action_data).float()
+        # 3. 获取 QPOS 和 Action (直接切片 RAM 中的数组，极快)
+        qpos_data = torch.from_numpy(data['qpos'][obs_ids]).float()
+        action_data = torch.from_numpy(data['action'][action_ids]).float()
         is_pad = torch.from_numpy(is_pad).bool()
 
         # 归一化
-        action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
+        action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
 
-        # 如果 num_obs == 1，为了兼容原来的模型，squeeze 掉 num_obs 维度
-        if self.num_obs == 1:
-            image_data = image_data.squeeze(0)  # (num_cam, 3, H, W)
-            qpos_data = qpos_data.squeeze(0)    # (state_dim,)
+        # 4. 获取图像 (解码 + 缓存)
+        all_imgs = []
+        for cam in self.camera_names:
+            cam_imgs = []
+            # 获取该相机该 episode 的所有 bytes 数组
+            full_bytes_seq = data['images'][cam] 
+            
+            for t in obs_ids:
+                # 取出单帧的 bytes numpy
+                img_byte_np = full_bytes_seq[t]
+                # 关键：转为 python bytes 传入缓存函数
+                img = self._cached_decode(img_byte_np.tobytes())
+                cam_imgs.append(img)
+            
+            all_imgs.append(np.stack(cam_imgs)) # (num_obs, H, W, 3)
+
+        # 堆叠 -> (num_obs, num_cam, H, W, 3)
+        image_data = np.stack(all_imgs, axis=1) 
         
-        return image_data, qpos_data, action_data, is_pad
+        # 转 Tensor 并调整维度 -> (num_obs, num_cam, 3, H, W)
+        image_data = torch.from_numpy(image_data).float() / 255.0
+        image_data = torch.einsum('t k h w c -> t k c h w', image_data)
 
+        # 兼容性处理：如果 num_obs=1，去掉时间维度
+        if self.num_obs == 1:
+            image_data = image_data.squeeze(0)
+            qpos_data = qpos_data.squeeze(0)
+
+        return image_data, qpos_data, action_data, is_pad
 
 def get_norm_stats(file_paths, num_episodes): 
     all_qpos_data = []

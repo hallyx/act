@@ -8,10 +8,11 @@ from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
 import gc
+import time
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
-from utils import load_data # data functions
+from utils import load_data, print_timing_stats, log_timing # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
@@ -365,19 +366,31 @@ def train_bc(train_dataloader, val_dataloader, config):
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
+    
     for epoch in tqdm(range(num_epochs)):
-        print(f'\nEpoch {epoch}')
+        epoch_start_time = time.time()
+        print(f'\n{"="*60}\nEpoch {epoch}\n{"="*60}')
+        
         # validation
+        val_start_time = time.time()
+        print(f"开始验证... (共 {len(val_dataloader)} 个batch)")
         with torch.inference_mode():
             policy.eval()
             epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
+                t_forward = time.time()
                 forward_dict = forward_pass(data, policy)
+                log_timing("10_val_forward_pass", time.time() - t_forward)
                 epoch_dicts.append(forward_dict)
                 # 清理中间变量减少内存占用
                 del data
                 if batch_idx % 50 == 0:  # 每50个batch清理一次
                     torch.cuda.empty_cache()
+                # 显示进度
+                if batch_idx % 100 == 0 or batch_idx == len(val_dataloader) - 1:
+                    elapsed = time.time() - val_start_time
+                    progress = (batch_idx + 1) / len(val_dataloader) * 100
+                    print(f"  验证进度: {batch_idx+1}/{len(val_dataloader)} ({progress:.1f}%) - 已耗时: {elapsed:.1f}s")
             epoch_summary = compute_dict_mean(epoch_dicts)
             validation_history.append(epoch_summary)
 
@@ -388,30 +401,45 @@ def train_bc(train_dataloader, val_dataloader, config):
             # 清理验证阶段的内存
             del epoch_dicts
             torch.cuda.empty_cache()
-        print(f'Val loss:   {epoch_val_loss:.5f}')
+        val_time = time.time() - val_start_time
+        print(f'Val loss:   {epoch_val_loss:.5f} (耗时: {val_time:.1f}s)')
         summary_string = ''
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
 
         # training
+        train_start_time = time.time()
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
+            t_data = time.time()
+            
+            t_forward = time.time()
             forward_dict = forward_pass(data, policy)
+            log_timing("20_train_forward_pass", time.time() - t_forward)
+            
             # backward
+            t_backward = time.time()
             loss = forward_dict['loss']
             loss.backward()
+            log_timing("21_backward", time.time() - t_backward)
+            
+            t_optim = time.time()
             optimizer.step()
             optimizer.zero_grad()
+            log_timing("22_optimizer_step", time.time() - t_optim)
+            
             train_history.append(detach_dict(forward_dict))
             # 清理中间变量
             del data, forward_dict, loss
             if batch_idx % 100 == 0:  # 每100个batch清理一次
                 torch.cuda.empty_cache()
+                
         epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
-        print(f'Train loss: {epoch_train_loss:.5f}')
+        train_time = time.time() - train_start_time
+        print(f'Train loss: {epoch_train_loss:.5f} (耗时: {train_time:.1f}s)')
         summary_string = ''
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
@@ -420,6 +448,13 @@ def train_bc(train_dataloader, val_dataloader, config):
         # 每个epoch结束后强制垃圾回收
         gc.collect()
         torch.cuda.empty_cache()
+        
+        epoch_total_time = time.time() - epoch_start_time
+        print(f'Epoch {epoch} 总耗时: {epoch_total_time:.1f}s (验证:{val_time:.1f}s + 训练:{train_time:.1f}s)')
+        
+        # 每10个epoch打印一次详细统计
+        if epoch % 10 == 0:
+            print_timing_stats()
 
         if epoch % 100 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
