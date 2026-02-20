@@ -84,8 +84,13 @@ def build_ACT_model_and_optimizer(args_override):
             "lr": args.lr_backbone,
         },
     ]
-    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    
+    optimizer_args = {"lr": args.lr, "weight_decay": args.weight_decay}
+    try:
+        import torch
+        optimizer = torch.optim.AdamW(param_dicts, fused=True, **optimizer_args)
+    except:
+        optimizer = torch.optim.AdamW(param_dicts, **optimizer_args)
 
     return model, optimizer
 
@@ -107,8 +112,13 @@ def build_CNNMLP_model_and_optimizer(args_override):
             "lr": args.lr_backbone,
         },
     ]
-    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    
+    optimizer_args = {"lr": args.lr, "weight_decay": args.weight_decay}
+    try:
+        import torch
+        optimizer = torch.optim.AdamW(param_dicts, fused=True, **optimizer_args)
+    except:
+        optimizer = torch.optim.AdamW(param_dicts, **optimizer_args)
 
     return model, optimizer
 
