@@ -33,8 +33,10 @@ def test_dataloader():
         camera_names, 
         batch_size, 
         batch_size,
+        loader_mode='sliding_window',
         chunk_size=chunk_size,
-        num_obs=1
+        stride=1,
+        num_workers=1
     )
     load_end = time.time()
     

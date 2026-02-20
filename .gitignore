@@ -148,7 +148,9 @@ ckpt_ja_aura/
 ckpt_ik_aura/
 ckpt_all_aura/
 ckpt_ik_hubble/
-ckpt_ik_edit_err
+ckpt_ik_edit_err/
+ckpt_mixed/
+*.ckpt
 
 data_ja/
 data_ik/

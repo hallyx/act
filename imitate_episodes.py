@@ -9,6 +9,11 @@ from tqdm import tqdm
 from einops import rearrange
 import gc
 import time
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.distributed.elastic.multiprocessing.errors import record
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
@@ -23,8 +28,105 @@ from sim_env import BOX_POSE
 import IPython
 e = IPython.embed
 
+def setup_distributed():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    if distributed:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        dist.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(local_rank)
+        rank = dist.get_rank()
+    else:
+        local_rank = 0
+        rank = 0
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+    return distributed, rank, world_size, local_rank
+
+
+def cleanup_distributed(distributed):
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def build_ddp_dataloaders(train_dataloader, val_dataloader, batch_size_train, batch_size_val, num_workers, rank, world_size):
+    train_dataset = train_dataloader.dataset
+    val_dataset = val_dataloader.dataset
+
+    train_workers = max(0, int(num_workers))
+    # 验证阶段不需要并行加载，避免 train/val 两套 worker 同时占用内存导致 OOM
+    val_workers = 0
+
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False
+    )
+    val_sampler = DistributedSampler(
+        val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
+    )
+
+    train_loader_kwargs = dict(
+        dataset=train_dataset,
+        batch_size=batch_size_train,
+        sampler=train_sampler,
+        shuffle=False,
+        pin_memory=False,
+        num_workers=train_workers,
+        persistent_workers=False,
+    )
+    if train_workers > 0:
+        # 降低预取深度，减少每个 worker 的队列缓存占用
+        train_loader_kwargs["prefetch_factor"] = 1
+
+    val_loader_kwargs = dict(
+        dataset=val_dataset,
+        batch_size=batch_size_val,
+        sampler=val_sampler,
+        shuffle=False,
+        pin_memory=False,
+        num_workers=val_workers,
+        persistent_workers=False,
+    )
+
+    train_loader = DataLoader(**train_loader_kwargs)
+    val_loader = DataLoader(**val_loader_kwargs)
+    return train_loader, val_loader
+
+
+def reduce_epoch_summary(epoch_summary, device, distributed):
+    if not distributed:
+        return epoch_summary
+
+    world_size = dist.get_world_size()
+    reduced = {}
+    for key, value in epoch_summary.items():
+        tensor = value.detach().to(device)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor = tensor / world_size
+        reduced[key] = tensor.cpu()
+    return reduced
+
+
+def init_running_stats(keys):
+    return {k: 0.0 for k in keys}
+
+
+def update_running_stats(running_stats, forward_dict):
+    for k, v in forward_dict.items():
+        running_stats[k] += float(v.detach().item())
+
+
+def finalize_running_stats(running_stats, count):
+    if count == 0:
+        return {k: torch.tensor(0.0) for k in running_stats.keys()}
+    return {k: torch.tensor(v / count) for k, v in running_stats.items()}
+
+
+@record
 def main(args):
     #os.environ["CUDA_VISIBLE_DEVICES"] = "1" # 指定使用 GPU 1,第二张卡，不需要时注释掉
+    distributed, rank, world_size, local_rank = setup_distributed()
+    is_main = rank == 0
+
     set_seed(1)
     # command line parameters
     is_eval = args['eval']
@@ -36,6 +138,10 @@ def main(args):
     batch_size_val = args['batch_size']
     num_epochs = args['num_epochs']
     num_obs = args.get('num_obs', 1)  # 获取观测窗口大小，默认为1
+    loader_mode = args.get('loader_mode', 'full_episode')
+    sliding_stride = args.get('sliding_stride', 1)
+    dataloader_workers = args.get('dataloader_workers', 1)
+    chunk_size = args['chunk_size'] if args.get('chunk_size') is not None else 50
     
     # get task parameters
     is_sim = 'True'
@@ -55,8 +161,8 @@ def main(args):
     camera_names = task_config['camera_names']
 
     # fixed parameters
-    state_dim = 21  # 基座位置(3) + 基座速度(6) + 关节位置(8) = 17维
-    action_dim = 16  # 关节位置(7) + 夹爪(1) + 关节速度(7) + 夹爪速度(1) = 16维
+    state_dim = 17  # 关节位置(8) + 基座位置(3) + 基座速度(6) = 17维
+    action_dim = 16  # 关节位置(7) + 夹爪(1)+速度(7) + 夹爪速度(1) = 16维
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -64,7 +170,7 @@ def main(args):
         dec_layers = 7
         nheads = 8
         policy_config = {'lr': args['lr'],
-                         'num_queries': args['chunk_size'],
+                         'num_queries': chunk_size,
                          'kl_weight': args['kl_weight'],
                          'hidden_dim': args['hidden_dim'],
                          'dim_feedforward': args['dim_feedforward'],
@@ -100,7 +206,18 @@ def main(args):
         'real_robot': not is_sim
     }
 
+    config.update({
+        'distributed': distributed,
+        'rank': rank,
+        'world_size': world_size,
+        'local_rank': local_rank,
+        'is_main': is_main,
+    })
+
     if is_eval:
+        if distributed and not is_main:
+            cleanup_distributed(distributed)
+            return
         ckpt_names = [f'policy_best.ckpt']
         results = []
         for ckpt_name in ckpt_names:
@@ -110,24 +227,49 @@ def main(args):
         for ckpt_name, success_rate, avg_return in results:
             print(f'{ckpt_name}: {success_rate=} {avg_return=}')
         print()
-        exit()
+        cleanup_distributed(distributed)
+        return
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, chunk_size=args['chunk_size'], num_obs=num_obs)
+    # Data Loading
+    if args.get('mixed_data', False):
+        from utils import load_mixed_data
+        # 注意：这里 dataset_dir 通常是 './data'
+        train_dataloader, val_dataloader, stats, _ = load_mixed_data(
+            dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
+            loader_mode=loader_mode, chunk_size=chunk_size, stride=sliding_stride, num_workers=dataloader_workers)
+    else:
+        train_dataloader, val_dataloader, stats, _ = load_data(
+            dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
+            loader_mode=loader_mode, chunk_size=chunk_size, stride=sliding_stride, num_workers=dataloader_workers)
+
+    if distributed:
+        train_dataloader, val_dataloader = build_ddp_dataloaders(
+            train_dataloader, val_dataloader,
+            batch_size_train=batch_size_train,
+            batch_size_val=batch_size_val,
+            num_workers=dataloader_workers,
+            rank=rank,
+            world_size=world_size,
+        )
 
     # save dataset stats
-    if not os.path.isdir(ckpt_dir):
-        os.makedirs(ckpt_dir)
-    stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
-    with open(stats_path, 'wb') as f:
-        pickle.dump(stats, f)
+    if is_main:
+        if not os.path.isdir(ckpt_dir):
+            os.makedirs(ckpt_dir)
+        stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
+        with open(stats_path, 'wb') as f:
+            pickle.dump(stats, f)
 
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
-    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+    if is_main:
+        best_epoch, min_val_loss, best_state_dict = best_ckpt_info
 
-    # save best checkpoint
-    ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
-    torch.save(best_state_dict, ckpt_path)
-    print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
+        # save best checkpoint
+        ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
+        torch.save(best_state_dict, ckpt_path)
+        print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
+
+    cleanup_distributed(distributed)
 
 
 def make_policy(policy_class, policy_config):
@@ -355,115 +497,162 @@ def train_bc(train_dataloader, val_dataloader, config):
     seed = config['seed']
     policy_class = config['policy_class']
     policy_config = config['policy_config']
+    distributed = config.get('distributed', False)
+    local_rank = config.get('local_rank', 0)
+    is_main = config.get('is_main', True)
 
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
-    policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
+    policy.cuda()
+    if distributed:
+        policy = DDP(
+            policy,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+            broadcast_buffers=False,
+        )
+    
+    # 开启混合精度训练 (AMP)
+    scaler = torch.cuda.amp.GradScaler()
 
     train_history = []
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
     
-    for epoch in tqdm(range(num_epochs)):
+    epoch_iter = tqdm(range(num_epochs)) if is_main else range(num_epochs)
+    for epoch in epoch_iter:
+        if distributed and isinstance(train_dataloader.sampler, DistributedSampler):
+            train_dataloader.sampler.set_epoch(epoch)
         epoch_start_time = time.time()
-        print(f'\n{"="*60}\nEpoch {epoch}\n{"="*60}')
+        if is_main:
+            print(f'\n{"="*60}\nEpoch {epoch}\n{"="*60}')
         
         # validation
         val_start_time = time.time()
-        print(f"开始验证... (共 {len(val_dataloader)} 个batch)")
-        with torch.inference_mode():
+        if is_main:
+            print(f"开始验证... (共 {len(val_dataloader)} 个batch)")
+        with torch.no_grad():
             policy.eval()
-            epoch_dicts = []
+            running_val_stats = None
+            val_count = 0
             for batch_idx, data in enumerate(val_dataloader):
                 t_forward = time.time()
-                forward_dict = forward_pass(data, policy)
+                with torch.cuda.amp.autocast():
+                    forward_dict = forward_pass(data, policy)
                 log_timing("10_val_forward_pass", time.time() - t_forward)
-                epoch_dicts.append(forward_dict)
+                if running_val_stats is None:
+                    running_val_stats = init_running_stats(forward_dict.keys())
+                update_running_stats(running_val_stats, forward_dict)
+                val_count += 1
+                
                 # 清理中间变量减少内存占用
-                del data
-                if batch_idx % 50 == 0:  # 每50个batch清理一次
-                    torch.cuda.empty_cache()
+                del data, forward_dict
+                # if batch_idx % 200 == 0:  # 减少清理频率
+                #     torch.cuda.empty_cache()
                 # 显示进度
-                if batch_idx % 100 == 0 or batch_idx == len(val_dataloader) - 1:
+                if is_main and (batch_idx % 100 == 0 or batch_idx == len(val_dataloader) - 1):
                     elapsed = time.time() - val_start_time
                     progress = (batch_idx + 1) / len(val_dataloader) * 100
                     print(f"  验证进度: {batch_idx+1}/{len(val_dataloader)} ({progress:.1f}%) - 已耗时: {elapsed:.1f}s")
-            epoch_summary = compute_dict_mean(epoch_dicts)
+            epoch_summary = finalize_running_stats(running_val_stats, val_count)
+            epoch_summary = reduce_epoch_summary(epoch_summary, device=torch.device("cuda", local_rank), distributed=distributed)
             validation_history.append(epoch_summary)
 
             epoch_val_loss = epoch_summary['loss']
-            if epoch_val_loss < min_val_loss:
+            if is_main and epoch_val_loss < min_val_loss:
                 min_val_loss = epoch_val_loss
-                best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
+                model_to_save = policy.module if hasattr(policy, "module") else policy
+                best_ckpt_info = (epoch, min_val_loss, deepcopy(model_to_save.state_dict()))
             # 清理验证阶段的内存
-            del epoch_dicts
+            del running_val_stats
             torch.cuda.empty_cache()
         val_time = time.time() - val_start_time
-        print(f'Val loss:   {epoch_val_loss:.5f} (耗时: {val_time:.1f}s)')
-        summary_string = ''
-        for k, v in epoch_summary.items():
-            summary_string += f'{k}: {v.item():.3f} '
-        print(summary_string)
+        if is_main:
+            print(f'Val loss:   {epoch_val_loss:.5f} (耗时: {val_time:.1f}s)')
+            summary_string = ''
+            for k, v in epoch_summary.items():
+                summary_string += f'{k}: {v.item():.3f} '
+            print(summary_string)
 
         # training
         train_start_time = time.time()
         policy.train()
         optimizer.zero_grad()
+        
+        running_train_stats = None
+        train_count = 0
+        
         for batch_idx, data in enumerate(train_dataloader):
-            t_data = time.time()
-            
             t_forward = time.time()
-            forward_dict = forward_pass(data, policy)
+            with torch.cuda.amp.autocast():
+                forward_dict = forward_pass(data, policy)
             log_timing("20_train_forward_pass", time.time() - t_forward)
             
             # backward
             t_backward = time.time()
             loss = forward_dict['loss']
-            loss.backward()
+            scaler.scale(loss).backward()
             log_timing("21_backward", time.time() - t_backward)
             
             t_optim = time.time()
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
             log_timing("22_optimizer_step", time.time() - t_optim)
             
-            train_history.append(detach_dict(forward_dict))
+            if running_train_stats is None:
+                running_train_stats = init_running_stats(forward_dict.keys())
+            update_running_stats(running_train_stats, forward_dict)
+            train_count += 1
+
             # 清理中间变量
             del data, forward_dict, loss
-            if batch_idx % 100 == 0:  # 每100个batch清理一次
-                torch.cuda.empty_cache()
+            # 大幅减少 empty_cache 频率，这在 4090 上非常耗时，仅在内存压力极大时使用
+            # if batch_idx % 500 == 0: 
+            #     torch.cuda.empty_cache()
                 
-        epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
+        epoch_summary = finalize_running_stats(running_train_stats, train_count)
+        epoch_summary = reduce_epoch_summary(epoch_summary, device=torch.device("cuda", local_rank), distributed=distributed)
         epoch_train_loss = epoch_summary['loss']
         train_time = time.time() - train_start_time
-        print(f'Train loss: {epoch_train_loss:.5f} (耗时: {train_time:.1f}s)')
-        summary_string = ''
-        for k, v in epoch_summary.items():
-            summary_string += f'{k}: {v.item():.3f} '
-        print(summary_string)
+        if is_main:
+            print(f'Train loss: {epoch_train_loss:.5f} (耗时: {train_time:.1f}s)')
+            summary_string = ''
+            for k, v in epoch_summary.items():
+                summary_string += f'{k}: {v.item():.3f} '
+            print(summary_string)
+            train_history.append(epoch_summary)
+        del running_train_stats
         
         # 每个epoch结束后强制垃圾回收
         gc.collect()
         torch.cuda.empty_cache()
         
         epoch_total_time = time.time() - epoch_start_time
-        print(f'Epoch {epoch} 总耗时: {epoch_total_time:.1f}s (验证:{val_time:.1f}s + 训练:{train_time:.1f}s)')
+        if is_main:
+            print(f'Epoch {epoch} 总耗时: {epoch_total_time:.1f}s (验证:{val_time:.1f}s + 训练:{train_time:.1f}s)')
         
-        # 每10个epoch打印一次详细统计
-        if epoch % 10 == 0:
+        # 每10个epoch打印一次详细统计并保存模型
+        if is_main and epoch % 10 == 0:
             print_timing_stats()
-
-        if epoch % 100 == 0:
+            model_to_save = policy.module if hasattr(policy, "module") else policy
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
-            torch.save(policy.state_dict(), ckpt_path)
+            torch.save(model_to_save.state_dict(), ckpt_path)
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
-    ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
-    torch.save(policy.state_dict(), ckpt_path)
+    if not is_main:
+        return None
 
+    model_to_save = policy.module if hasattr(policy, "module") else policy
+    ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
+    torch.save(model_to_save.state_dict(), ckpt_path)
+
+    if best_ckpt_info is None:
+        best_ckpt_info = (num_epochs - 1, float('inf'), deepcopy(model_to_save.state_dict()))
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
     ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
     torch.save(best_state_dict, ckpt_path)
@@ -511,5 +700,21 @@ if __name__ == '__main__':
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
     parser.add_argument('--num_obs', action='store', type=int, default=1, help='num_obs', required=False)
+    parser.add_argument('--mixed_data', action='store_true',default=True, help='Use mixed data from multiple folders')
+    parser.add_argument('--loader_mode', action='store', type=str, default='full_episode',
+                        choices=['full_episode', 'sliding_window'],
+                        help='Data loading mode for training samples')
+    parser.add_argument('--sliding_stride', action='store', type=int, default=1,
+                        help='Stride used when loader_mode=sliding_window')
+    parser.add_argument('--dataloader_workers', action='store', type=int, default=1,
+                        help='DataLoader num_workers')
     
-    main(vars(parser.parse_args()))
+    try:
+        main(vars(parser.parse_args()))
+    except Exception:
+        import traceback
+        rank = int(os.environ.get("RANK", "-1"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+        print(f"[FATAL] rank={rank}, local_rank={local_rank}")
+        traceback.print_exc()
+        raise

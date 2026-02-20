@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import os
 import h5py
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader
 import cv2
 import time
 from collections import defaultdict
@@ -11,7 +11,6 @@ import IPython
 e = IPython.embed
 
 import glob
-from functools import lru_cache
 
 # 全局计时器统计
 TIMING_STATS = defaultdict(lambda: {"count": 0, "total_time": 0.0})
@@ -32,8 +31,6 @@ def print_timing_stats():
         print(f"{name:40s} | 总计: {stats['total_time']:8.2f}s | "
               f"调用: {stats['count']:6d}次 | 平均: {avg_time*1000:7.2f}ms")
     print("="*60 + "\n")
-
-@lru_cache(maxsize=1000) # 缓存最近使用的 1000 帧解码图像
 
 def find_all_hdf5(dataset_dir):
     """
@@ -62,151 +59,114 @@ def find_all_hdf5(dataset_dir):
     return filtered_paths
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, file_paths, camera_names, norm_stats, num_obs, num_action):
-        super(EpisodicDataset, self).__init__()
-        self.num_obs = num_obs
-        self.num_action = num_action
+    def __init__(self, file_paths, camera_names, norm_stats, loader_mode='full_episode', chunk_size=50, stride=1, random_start=True):
+        super(EpisodicDataset).__init__()
+        self.file_paths = file_paths
         self.camera_names = camera_names
         self.norm_stats = norm_stats
-        self.is_sim = True
-        
-        # === 核心优化：内存数据仓库 ===
-        # 我们不存 h5py 对象，而是把数据读入 RAM
-        # 但对于图像，我们只存 "bytes" (压缩数据)，不解码，以节省内存
-        self.episode_data = [] 
-        self.samples = [] 
-        
-        print(f"Loading {len(file_paths)} episodes to RAM (Images kept as bytes)...")
-        
-        q_left_index = [0, 2, 4, 6, 8, 10, 12] # 左臂关节索引
+        self.loader_mode = loader_mode
+        self.chunk_size = int(chunk_size)
+        self.stride = int(stride)
+        self.random_start = random_start
+        self.is_sim = None
+        self.sample_index = []
 
-        for ep_i, path in enumerate(file_paths):
-            with h5py.File(path, 'r') as root:
-                # 1. 读取基础数据
-                # 注意：这里我们直接处理好 qpos 和 action 的维度，避免在 getitem 里重复切片
-                
-                # --- QPOS 处理 (21维) ---
-                base_pose = root['/observations/base_pose'][()]
-                base_vel = root['/observations/base_vel'][()]
-                full_qpos = root['/observations/joint_pos'][()]
-                T = full_qpos.shape[0]
-                
-                # 构造 joint_qpos (8维: 7关节 + 1夹爪)
-                # 假设 sim 数据中 joint_pos 是 14 维，我们需要取左臂
-                # 如果你的数据结构不同，请检查这里的维度
-                joint_qpos_left = full_qpos[:, q_left_index]
-                # 模拟数据通常夹爪需要单独处理，这里假设追加一个 0 或者从某处读取
-                # 你的原始代码中是: qpos_gripper = np.array([0.0])，这里我们在 batch 维度构造
-                gripper_pad = np.zeros((T, 1), dtype=np.float32) 
-                
-                qpos_data = np.concatenate([joint_qpos_left, gripper_pad, base_pose, base_vel], axis=1).astype(np.float32)
+        if self.loader_mode not in ['full_episode', 'sliding_window']:
+            raise ValueError(f"Invalid loader_mode={self.loader_mode}. Use 'full_episode' or 'sliding_window'.")
+        if self.chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0, got {self.chunk_size}")
+        if self.stride <= 0:
+            raise ValueError(f"stride must be > 0, got {self.stride}")
 
-                # --- Action 处理 (16维) ---
-                action_pos_full = root['/action/joint_positions'][()]
-                action_vel_full = root['/action/joint_velocities'][()]
-                action_gripper_full = root['/action/gripper_command'][()]
-                
-                action_pos = action_pos_full[:, q_left_index]
-                action_vel = action_vel_full[:, q_left_index]
-                action_gripper = action_gripper_full[:, 0:1] # 取第一维
-                action_gripper_vel = np.zeros((T, 1), dtype=np.float32)
-                
-                action_data = np.concatenate([action_pos, action_gripper, action_vel, action_gripper_vel], axis=1).astype(np.float32)
+        if len(self.file_paths) == 0:
+            raise ValueError("No file_paths provided to EpisodicDataset.")
 
-                # --- 图像 Bytes 读取 ---
-                # 关键：只读 bytes，不解码
-                image_bytes_dict = {}
-                for cam in camera_names:
-                    # h5py 读取出的通常是 numpy 数组格式的 bytes
-                    image_bytes_dict[cam] = root[f'observations/{cam}'][()]
+        if self.loader_mode == 'sliding_window':
+            print(f"Indexing {len(self.file_paths)} episodes... (mode={self.loader_mode}, chunk={self.chunk_size}, stride={self.stride})")
+            for file_idx, file_path in enumerate(self.file_paths):
+                with h5py.File(file_path, 'r') as root:
+                    episode_len = root['/action/joint_positions'].shape[0]
+                for start_ts in range(0, episode_len, self.stride):
+                    self.sample_index.append((file_idx, start_ts))
+            print(f"Total samples indexed: {len(self.sample_index)}")
 
-                # 存入列表
-                self.episode_data.append({
-                    'qpos': qpos_data,
-                    'action': action_data,
-                    'images': image_bytes_dict,
-                    'len': T
-                })
-
-                # --- 建立索引 ---
-                # 遍历 T-1 步 (根据你的逻辑)
-                for t in range(T - 1):
-                    self.samples.append((ep_i, t))
-
-        print(f"Loaded {len(self.samples)} samples. Ready for training.")
-
-    @staticmethod
-    @lru_cache(maxsize=3000) # 缓存 3000 张图，足够覆盖 num_workers * batch_size * num_obs
-    def _cached_decode(img_bytes_raw):
-        """
-        静态方法 + LRU 缓存
-        必须接收 bytes 类型 (hashable)，不能接收 numpy array
-        """
-        nparr = np.frombuffer(img_bytes_raw, np.uint8)
-        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        self.__getitem__(0)  # initialize self.is_sim
 
     def __len__(self):
-        return len(self.samples)
+        if self.loader_mode == 'sliding_window':
+            return len(self.sample_index)
+        return len(self.file_paths)
 
     def __getitem__(self, index):
-        ep_idx, cur_idx = self.samples[index]
-        data = self.episode_data[ep_idx]
-        T = data['len']
+        if self.loader_mode == 'sliding_window':
+            file_idx, start_ts = self.sample_index[index]
+            dataset_path = self.file_paths[file_idx]
+        else:
+            dataset_path = self.file_paths[index]
+            start_ts = None
 
-        # 1. 确定 Observation 窗口索引
-        # 如果 cur_idx < num_obs, 用第一帧填充
-        obs_ids = []
-        for i in range(self.num_obs):
-            t = max(0, cur_idx - (self.num_obs - 1) + i)
-            obs_ids.append(t)
+        with h5py.File(dataset_path, 'r') as root:
+            self.is_sim = True
+            original_action_shape = root['/action/joint_positions'].shape
+            episode_len = original_action_shape[0]
 
-        # 2. 确定 Action 预测窗口索引
-        act_start = cur_idx # 包含当前帧
-        action_ids = []
-        is_pad = np.zeros(self.num_action, dtype=bool)
-        for i in range(self.num_action):
-            t = act_start + i
-            if t >= T:
-                t = T - 1
-                is_pad[i] = True
-            action_ids.append(t)
+            if start_ts is None:
+                if self.random_start:
+                    start_ts = np.random.randint(episode_len)
+                else:
+                    start_ts = 0
 
-        # 3. 获取 QPOS 和 Action (直接切片 RAM 中的数组，极快)
-        qpos_data = torch.from_numpy(data['qpos'][obs_ids]).float()
-        action_data = torch.from_numpy(data['action'][action_ids]).float()
+            base_pose = root['/observations/base_pose'][start_ts]
+            base_pos = base_pose[:3]
+            base_vel = root['/observations/base_vel'][start_ts]
+            full_qos = root['/observations/joint_pos'][start_ts]
+            q_left_index = [0,2,4,6,8,10,12]
+            qpos_gripper = np.array([0.0])
+            joint_qpos = np.concatenate([full_qos[q_left_index], qpos_gripper])
+            qpos = np.concatenate([joint_qpos, base_pos, base_vel])
+
+            image_dict = dict()
+            for cam_name in self.camera_names:
+                img_bytes = root[f'/observations/{cam_name}'][start_ts]
+                img_bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+                image_dict[cam_name] = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+            action_joints_full = root['/action/joint_positions'][start_ts:]
+            action_joints = action_joints_full[:, q_left_index]
+            action_joints_vel_full = root['/action/joint_velocities'][start_ts:]
+            action_joints_vel = action_joints_vel_full[:, q_left_index]
+            action_gripper_full = root['/action/gripper_command'][start_ts:]
+            action_gripper = action_gripper_full[:, 0:1]
+            action_gripper_vel = action_gripper_full[:, 0:1]
+            action = np.concatenate([action_joints, action_gripper, action_joints_vel, action_gripper_vel], axis=-1)
+
+            if self.loader_mode == 'sliding_window':
+                target_len = self.chunk_size
+            else:
+                target_len = original_action_shape[0]
+
+            action_len = min(action.shape[0], target_len)
+
+        padded_action = np.zeros((target_len, action.shape[-1]), dtype=np.float32)
+        padded_action[:action_len] = action[:action_len]
+        is_pad = np.zeros(target_len, dtype=np.float32)
+        is_pad[action_len:] = 1
+
+        all_cam_images = []
+        for cam_name in self.camera_names:
+            all_cam_images.append(image_dict[cam_name])
+        all_cam_images = np.stack(all_cam_images, axis=0)
+
+        image_data = torch.from_numpy(all_cam_images)
+        qpos_data = torch.from_numpy(qpos).float()
+        action_data = torch.from_numpy(padded_action).float()
         is_pad = torch.from_numpy(is_pad).bool()
 
-        # 归一化
-        qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
+        image_data = torch.einsum('k h w c -> k c h w', image_data)
+
+        image_data = image_data / 255.0
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
-
-        # 4. 获取图像 (解码 + 缓存)
-        all_imgs = []
-        for cam in self.camera_names:
-            cam_imgs = []
-            # 获取该相机该 episode 的所有 bytes 数组
-            full_bytes_seq = data['images'][cam] 
-            
-            for t in obs_ids:
-                # 取出单帧的 bytes numpy
-                img_byte_np = full_bytes_seq[t]
-                # 关键：转为 python bytes 传入缓存函数
-                img = self._cached_decode(img_byte_np.tobytes())
-                cam_imgs.append(img)
-            
-            all_imgs.append(np.stack(cam_imgs)) # (num_obs, H, W, 3)
-
-        # 堆叠 -> (num_obs, num_cam, H, W, 3)
-        image_data = np.stack(all_imgs, axis=1) 
-        
-        # 转 Tensor 并调整维度 -> (num_obs, num_cam, 3, H, W)
-        image_data = torch.from_numpy(image_data).float() / 255.0
-        image_data = torch.einsum('t k h w c -> t k c h w', image_data)
-
-        # 兼容性处理：如果 num_obs=1，去掉时间维度
-        if self.num_obs == 1:
-            image_data = image_data.squeeze(0)
-            qpos_data = qpos_data.squeeze(0)
+        qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
         return image_data, qpos_data, action_data, is_pad
 
@@ -233,23 +193,20 @@ def get_norm_stats(file_paths, num_episodes):
             q_pos_gripper = np.zeros((full_qpos.shape[0], 1))
             joint_qpos = np.concatenate([full_qpos[:, q_left_index], q_pos_gripper], axis=1)
             
-            # 组合:关节位置(8)+ 基座位置(3) + 基座姿态(4) + 基座速度(6) +  = 21维
-            qpos = np.concatenate([joint_qpos, base_pose, base_vel], axis=1)
+            # 组合: 关节位置(8) + 基座位置(3) + 基座速度(6) = 17维
+            qpos = np.concatenate([joint_qpos, base_pos, base_vel], axis=1)
 
-            # 位置
+            # 位置 (Action)
             action_joints_pos_full = root['/action/joint_positions'][()]
             action_joints_pos = action_joints_pos_full[:, q_left_index]  # (T, 7)
-            action_gripper_full = root['/action/gripper_command'][()]
-            action_gripper = action_gripper_full[:, 0:1]  # 只取左臂夹爪 (T, 1)
-            
-            # 速度
             action_joints_vel_full = root['/action/joint_velocities'][()]
             action_joints_vel = action_joints_vel_full[:, q_left_index]  # (T, 7)
-            action_gripper_vel = np.zeros((action_gripper.shape[0], 1), dtype=np.float32)  # (T, 1)
+            action_gripper_full = root['/action/gripper_command'][()]
+            action_gripper = action_gripper_full[:, 0:1]  # 只取左臂夹爪 (T, 1)
+            action_gripper_vel = action_gripper_full[:, 0:1]  # 假设夹爪速度为0
             
-            # 组合: joint_pos(7) + gripper(1) + joint_vel(7) + gripper_vel(1) = 16
-            action = np.concatenate([action_joints_pos, action_gripper,
-                                    action_joints_vel, action_gripper_vel], axis=-1)
+            # 组合: joint_pos(7) + gripper(1) = 8 维
+            action = np.concatenate([action_joints_pos, action_gripper, action_joints_vel, action_gripper_vel ], axis=-1)
             
         all_qpos_data.append(torch.from_numpy(qpos))
         all_action_data.append(torch.from_numpy(action))
@@ -278,7 +235,79 @@ def get_norm_stats(file_paths, num_episodes):
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, chunk_size=50, num_obs=1):
+def load_mixed_data(data_root, num_episodes, camera_names, batch_size_train, batch_size_val, loader_mode='full_episode', chunk_size=50, stride=1, num_workers=1):
+    """
+    随机在 data_ik 和 data_ja 下各抽取或随机抽取两个子文件夹，
+    并从每个文件夹中随机抽取 50% 的文件进行混合训练。
+    使用回档后的加载逻辑。
+    """
+    import random
+    print(f'\nLoading Mixed Data from: {data_root}')
+    
+    # 1. 搜集所有子文件夹 (例如 data/data_ik/aura_k1)
+    subfolders = []
+    for method in ['data_ik', 'data_ja']:
+        method_path = os.path.join(data_root, method)
+        if os.path.exists(method_path):
+            current_subs = [os.path.join(method_path, f) for f in os.listdir(method_path) 
+                           if os.path.isdir(os.path.join(method_path, f))]
+            subfolders.extend(current_subs)
+    
+    if len(subfolders) == 0:
+        raise ValueError(f"No subfolders found in {data_root}.")
+
+    # 2. 使用所有子文件夹
+    selected_folders = subfolders
+    print(f"Selected {len(selected_folders)} folders for mixed training:")
+    for folder in selected_folders:
+        print(f"  - {folder}")
+
+    # 3. 从所有文件夹中搜集所有文件
+    all_mixed_paths = []
+    for folder in selected_folders:
+        folder_files = find_all_hdf5(folder)
+        print(f"  Folder: {os.path.basename(folder)} | Found {len(folder_files)} recovery files")
+        all_mixed_paths.extend(folder_files)
+
+    total_files_before = len(all_mixed_paths)
+    print(f"Total files from both folders: {total_files_before}")
+    
+    # 4. 从所有文件中随机抽取50% (即450条，如果总共900条)
+    random.shuffle(all_mixed_paths)
+    keep_count = max(1, total_files_before // 2)
+    all_mixed_paths = all_mixed_paths[:keep_count]
+    total_files = len(all_mixed_paths)
+    print(f"Selected {total_files} files (50% of total) for mixed training")
+
+    # 5. 后续逻辑与 load_data 一致：打乱、划分、计算 stats
+    shuffled_indices = np.random.permutation(total_files)
+    shuffled_paths = [all_mixed_paths[i] for i in shuffled_indices]
+    
+    train_ratio = 0.8
+    num_train = int(train_ratio * total_files)
+    train_paths = shuffled_paths[:num_train]
+    val_paths = shuffled_paths[num_train:]
+
+    print(f"Train files: {len(train_paths)}, Val files: {len(val_paths)}")
+
+    # 计算统计值
+    norm_stats = get_norm_stats(train_paths, num_episodes=num_episodes)
+
+    train_dataset = EpisodicDataset(
+        train_paths, camera_names, norm_stats,
+        loader_mode=loader_mode, chunk_size=chunk_size, stride=stride, random_start=(loader_mode == 'full_episode')
+    )
+    val_dataset = EpisodicDataset(
+        val_paths, camera_names, norm_stats,
+        loader_mode=loader_mode, chunk_size=chunk_size, stride=stride, random_start=False
+    )
+    
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=num_workers)
+
+    return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
+
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, loader_mode='full_episode', chunk_size=50, stride=1, num_workers=1):
     print(f'\nData from: {dataset_dir}\n')
     
     # 1. 获取所有文件的绝对路径 (包含子文件夹)
@@ -294,7 +323,7 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     shuffled_paths = [all_file_paths[i] for i in shuffled_indices] # 使用列表推导式重排
     
     # 3. 划分训练/验证集
-    train_ratio = 0.9  # 增加训练集比例，减少验证集（从0.8改为0.9）
+    train_ratio = 0.8
     num_train = int(train_ratio * total_files)
     
     train_paths = shuffled_paths[:num_train]
@@ -306,16 +335,20 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     # 注意：这里我们通常用所有训练数据来计算 Stats，或者取前 num_episodes 个
     norm_stats = get_norm_stats(train_paths, num_episodes=num_episodes)
 
-    # 5. 构造 Dataset (传入路径列表)
-    train_dataset = EpisodicDataset(train_paths, camera_names, norm_stats, num_obs=num_obs, num_action=chunk_size)
-    val_dataset = EpisodicDataset(val_paths, camera_names, norm_stats, num_obs=num_obs, num_action=chunk_size)
+    train_dataset = EpisodicDataset(
+        train_paths, camera_names, norm_stats,
+        loader_mode=loader_mode, chunk_size=chunk_size, stride=stride, random_start=(loader_mode == 'full_episode')
+    )
+    val_dataset = EpisodicDataset(
+        val_paths, camera_names, norm_stats,
+        loader_mode=loader_mode, chunk_size=chunk_size, stride=stride, random_start=False
+    )
     
-    # 使用单进程加载以避免多进程内存问题
-    # 如果数据加载太慢，考虑预加载或使用更高效的数据格式
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=False, num_workers=0)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=False, pin_memory=False, num_workers=0)
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=num_workers)
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
+
 
 
 ### env utils
