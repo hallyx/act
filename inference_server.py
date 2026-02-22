@@ -1,33 +1,39 @@
 #!/usr/bin/env python3
 import os
-
-# === GPU 设置 ===
-# 限制可见 GPU，避免与 Isaac Sim 冲突（如果在同一台机器上运行）
-os.environ["CUDA_VISIBLE_DEVICES"] = "0" # 如果是独立显卡运行，请根据实际情况修改
+import json
+import argparse
 
 import torch
 import numpy as np
 import pickle
 import zmq
 from einops import rearrange
-from copy import deepcopy
+from constants import SIM_TASK_CONFIGS
 
-# 从你的项目结构中导入 ACTPolicy
-# 假设你的目录结构是:
-# project/
-#   act_server.py
-#   policy.py (ACT模型定义)
-#   detr/ ...
 from policy import ACTPolicy
 
-# === 配置区域 ===
-PORT = "5555"
-CKPT_DIR = './ckpt_ik' # 你的模型权重路径
-TASK_NAME = 'astrobench_dual_arm'
 
-# 相机配置（必须和客户端 run_client.py 中的 key 匹配！）
-CAMERA_NAMES = ['rgb_main', 'rgb_left', 'rgb_right', 'rgb_under']
-# ================
+class NumpyCompatUnpickler(pickle.Unpickler):
+    """Compat unpickler for numpy module path changes across versions."""
+    def find_class(self, module, name):
+        if module.startswith("numpy._core"):
+            module = module.replace("numpy._core", "numpy.core", 1)
+        elif module.startswith("numpy.core"):
+            module = module.replace("numpy.core", "numpy._core", 1)
+        return super().find_class(module, name)
+
+
+def load_pickle_compat(path):
+    with open(path, "rb") as f:
+        try:
+            return pickle.load(f)
+        except ModuleNotFoundError as e:
+            msg = str(e)
+            if "numpy._core" in msg or "numpy.core" in msg:
+                f.seek(0)
+                print("[Init] Fallback to numpy-compatible unpickler for dataset stats.")
+                return NumpyCompatUnpickler(f).load()
+            raise
 
 def make_policy(policy_class, policy_config):
     if policy_class == 'ACT':
@@ -36,55 +42,82 @@ def make_policy(policy_class, policy_config):
         raise NotImplementedError
     return policy
 
+def load_config(config_path):
+    with open(config_path, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+
+    defaults = {
+        "port": "5555",
+        "cuda_visible_devices": "0",
+        "ckpt_dir": "./ckpt/ckpt_ik_sliding/",
+        "task_name": "astrobench_dual_arm",
+        "camera_names": None,
+        "max_timesteps": 2000,
+        "temporal_agg_k": 0.1,
+        "policy": {
+            "policy_class": "ACT",
+            "lr": 1e-5,
+            "num_queries": 50,
+            "kl_weight": 10,
+            "hidden_dim": 512,
+            "dim_feedforward": 3200,
+            "lr_backbone": 5e-6,
+            "backbone": "resnet18",
+            "enc_layers": 4,
+            "dec_layers": 7,
+            "nheads": 8,
+            "state_dim": 17,
+            "action_dim": 16
+        }
+    }
+
+    merged = defaults.copy()
+    merged.update(cfg)
+    policy_cfg = defaults["policy"].copy()
+    policy_cfg.update(cfg.get("policy", {}))
+    merged["policy"] = policy_cfg
+
+    if merged["camera_names"] is None:
+        task_name = merged["task_name"]
+        if task_name in SIM_TASK_CONFIGS:
+            merged["camera_names"] = SIM_TASK_CONFIGS[task_name]["camera_names"]
+        else:
+            raise ValueError(
+                f"camera_names not set in config and task '{task_name}' is not found in SIM_TASK_CONFIGS."
+            )
+
+    merged["policy"]["camera_names"] = merged["camera_names"]
+    return merged
+
 class ACTInferenceServer:
-    def __init__(self, ckpt_dir, task_name, camera_names):
-        self.ckpt_dir = ckpt_dir
-        self.task_name = task_name
-        self.camera_names = camera_names
+    def __init__(self, config):
+        self.config = config
+        self.ckpt_dir = config["ckpt_dir"]
+        self.task_name = config["task_name"]
+        self.camera_names = config["camera_names"]
+        self.temporal_agg_k = float(config["temporal_agg_k"])
+        self.max_timesteps = int(config["max_timesteps"])
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        print(f"[Init] Task: {task_name}")
-        print(f"[Init] Camera names: {camera_names}")
+        print(f"[Init] Task: {self.task_name}")
+        print(f"[Init] Camera names: {self.camera_names}")
+        print(f"[Init] Device: {self.device}")
         
         # 1. 加载归一化统计数据
-        stats_path = os.path.join(ckpt_dir, 'dataset_stats.pkl')
-        with open(stats_path, 'rb') as f:
-            self.stats = pickle.load(f)
+        stats_path = os.path.join(self.ckpt_dir, 'dataset_stats.pkl')
+        self.stats = load_pickle_compat(stats_path)
         print("[Init] Loaded dataset stats.")
             
-        # 2. 初始化模型配置
-        # [关键] 必须与训练时的参数完全一致！
-        # State Dim = 24:
-        #   Base Pos (3) + Base Quat(4) ? (看你训练数据, 假设是7) + Joint Pos(14) ? 
-        #   根据你的 Isaac Sim 发送的数据:
-        #   qpos_16d = [Base Pos(3), Base Vel(6), Left Arm(7), Left Grip(1)] = 17 维
-        #   请确认你的训练数据到底是 17 还是 24?
-        #   根据你之前的描述 action_dim=16 (7pos+1grip+7vel+1grip_vel)
-        #   这里假设 state_dim 是 17 (和你原来的代码一致)
-        policy_config = {
-            'lr': 1e-5, 
-            #'num_queries': 20, # chunk size
-            #'kl_weight': 0.10, 
-            'num_queries': 50,
-            'kl_weight': 10,
-            'hidden_dim': 512, 
-            'dim_feedforward': 3200,
-            'lr_backbone': 5e-6, 
-            'backbone': 'resnet18', 
-            'enc_layers': 4, 
-            'dec_layers': 7, 
-            'nheads': 8,
-            'camera_names': self.camera_names,
-            'state_dim': 17,  # [必须确认] 客户端发送的是 [BasePos(3) + BaseVel(6) + ArmPos(7) + Grip(1)]
-            'action_dim': 16  # [必须确认] 输出动作 [ArmPos(7) + Grip(1) + ArmVel(7) + GripVel(1)]
-        }
+        # 2. 初始化模型配置（从配置文件读取）
+        policy_config = config["policy"]
         
-        self.policy = make_policy('ACT', policy_config)
+        self.policy = make_policy(policy_config.get("policy_class", "ACT"), policy_config)
         
         # 加载权重
-        ckpt_path = os.path.join(ckpt_dir, 'policy_best.ckpt')
-        state_dict = torch.load(ckpt_path)
+        ckpt_path = os.path.join(self.ckpt_dir, 'policy_best.ckpt')
+        state_dict = torch.load(ckpt_path, map_location='cpu')
         self.policy.load_state_dict(state_dict)
-        self.policy.cuda()
+        self.policy.to(self.device)
         self.policy.eval()
         print(f"[Init] Loaded model from {ckpt_path}")
 
@@ -92,13 +125,12 @@ class ACTInferenceServer:
         self.chunk_size = policy_config['num_queries']
         self.state_dim = policy_config['state_dim']
         self.action_dim = policy_config['action_dim']
-        self.max_timesteps = 2000 # 足够覆盖最长 episode
         
         self.all_time_actions = torch.zeros([
             self.max_timesteps,
             self.max_timesteps + self.chunk_size,
             self.action_dim
-        ]).cuda()
+        ], dtype=torch.float32, device=self.device)
         self.t = 0 
 
     def pre_process(self, qpos_numpy):
@@ -126,7 +158,7 @@ class ACTInferenceServer:
         with torch.inference_mode():
             # 1. 预处理
             qpos_norm = self.pre_process(qpos)
-            qpos_tensor = torch.from_numpy(qpos_norm).float().cuda().unsqueeze(0)
+            qpos_tensor = torch.from_numpy(qpos_norm).float().to(self.device).unsqueeze(0)
             
             curr_images = []
             for cam_name in self.camera_names:
@@ -136,7 +168,7 @@ class ACTInferenceServer:
             curr_image_stack = np.stack(curr_images, axis=0)
             
             # 归一化图像 [0, 255] -> [0, 1]
-            image_tensor = torch.from_numpy(curr_image_stack / 255.0).float().cuda().unsqueeze(0)
+            image_tensor = torch.from_numpy(curr_image_stack / 255.0).float().to(self.device).unsqueeze(0)
 
             # 2. 模型推理 -> (1, chunk_size, action_dim)
             all_actions = self.policy(qpos_tensor, image_tensor)
@@ -154,10 +186,10 @@ class ACTInferenceServer:
             actions_for_curr_step = actions_for_curr_step[actions_populated]
             
             # 指数加权平均
-            k = 0.1
+            k = self.temporal_agg_k
             exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
             exp_weights = exp_weights / exp_weights.sum()
-            exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+            exp_weights = torch.from_numpy(exp_weights).to(self.device).unsqueeze(dim=1)
             
             raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
             
@@ -179,13 +211,21 @@ class ACTInferenceServer:
         print("[Server] Temporal aggregation buffer reset.")
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='inference_config.json', help='Path to inference JSON config')
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg["cuda_visible_devices"])
+    port = str(cfg["port"])
+
     context = zmq.Context()
     socket = context.socket(zmq.REP)
-    socket.bind(f"tcp://*:{PORT}")
-    print(f"[Server] ACT Inference Server listening on port {PORT}...")
+    socket.bind(f"tcp://*:{port}")
+    print(f"[Server] ACT Inference Server listening on port {port}...")
     
     # 初始化引擎
-    engine = ACTInferenceServer(CKPT_DIR, TASK_NAME, CAMERA_NAMES)
+    engine = ACTInferenceServer(cfg)
 
     while True:
         try:
@@ -205,6 +245,9 @@ def main():
             # 客户端发送: {'qpos': ..., 'images': ..., 'command': 'step'}
             qpos = data['qpos']
             images = data['images']
+            episode_id = data.get('episode_id')
+            step_id = data.get('step_id')
+            timestamp = data.get('timestamp')
             
             # 4. 执行推理
             action = engine.predict(qpos, images)
@@ -214,6 +257,12 @@ def main():
                 'joint_positions': action, # 这里实际上包含了 pos(8) + vel(8)
                 'status': 'OK'
             }
+            if episode_id is not None:
+                response['episode_id'] = episode_id
+            if step_id is not None:
+                response['step_id'] = step_id
+            if timestamp is not None:
+                response['timestamp'] = timestamp
             socket.send(pickle.dumps(response))
             
             # Log first step
@@ -224,7 +273,15 @@ def main():
             print(f"[Server Error] {e}")
             # 发送错误响应防止客户端卡死
             try:
-                socket.send(pickle.dumps({'status': 'ERROR', 'message': str(e)}))
+                error_response = {'status': 'ERROR', 'message': str(e)}
+                if isinstance(data, dict):
+                    if data.get('episode_id') is not None:
+                        error_response['episode_id'] = data.get('episode_id')
+                    if data.get('step_id') is not None:
+                        error_response['step_id'] = data.get('step_id')
+                    if data.get('timestamp') is not None:
+                        error_response['timestamp'] = data.get('timestamp')
+                socket.send(pickle.dumps(error_response))
             except:
                 pass
 

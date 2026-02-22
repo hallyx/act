@@ -141,6 +141,7 @@ def main(args):
     loader_mode = args.get('loader_mode', 'full_episode')
     sliding_stride = args.get('sliding_stride', 1)
     dataloader_workers = args.get('dataloader_workers', 1)
+    resume_ckpt = args.get('resume_ckpt', None)
     chunk_size = args['chunk_size'] if args.get('chunk_size') is not None else 50
     
     # get task parameters
@@ -203,7 +204,8 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        'resume_ckpt': resume_ckpt,
     }
 
     config.update({
@@ -500,10 +502,28 @@ def train_bc(train_dataloader, val_dataloader, config):
     distributed = config.get('distributed', False)
     local_rank = config.get('local_rank', 0)
     is_main = config.get('is_main', True)
+    resume_ckpt = config.get('resume_ckpt', None)
 
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
+    if resume_ckpt:
+        if not os.path.exists(resume_ckpt):
+            raise FileNotFoundError(f"resume_ckpt not found: {resume_ckpt}")
+        ckpt_obj = torch.load(resume_ckpt, map_location='cpu')
+        if isinstance(ckpt_obj, dict):
+            if 'model_state_dict' in ckpt_obj:
+                model_state = ckpt_obj['model_state_dict']
+            elif 'state_dict' in ckpt_obj:
+                model_state = ckpt_obj['state_dict']
+            else:
+                model_state = ckpt_obj
+        else:
+            model_state = ckpt_obj
+        load_status = policy.load_state_dict(model_state, strict=True)
+        if is_main:
+            print(f"[Resume] Loaded checkpoint: {resume_ckpt}")
+            print(f"[Resume] load_state_dict status: {load_status}")
     optimizer = make_optimizer(policy_class, policy)
     policy.cuda()
     if distributed:
@@ -700,7 +720,7 @@ if __name__ == '__main__':
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
     parser.add_argument('--num_obs', action='store', type=int, default=1, help='num_obs', required=False)
-    parser.add_argument('--mixed_data', action='store_true',default=True, help='Use mixed data from multiple folders')
+    parser.add_argument('--mixed_data', action='store_true',default=False, help='Use mixed data from multiple folders')
     parser.add_argument('--loader_mode', action='store', type=str, default='full_episode',
                         choices=['full_episode', 'sliding_window'],
                         help='Data loading mode for training samples')
@@ -708,6 +728,8 @@ if __name__ == '__main__':
                         help='Stride used when loader_mode=sliding_window')
     parser.add_argument('--dataloader_workers', action='store', type=int, default=1,
                         help='DataLoader num_workers')
+    parser.add_argument('--resume_ckpt', action='store', type=str, default=None,
+                        help='Path to checkpoint for resuming training (model weights)')
     
     try:
         main(vars(parser.parse_args()))
