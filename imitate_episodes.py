@@ -307,6 +307,32 @@ def count_parameters(model):
     # 计算所有 requires_grad=True 的参数（即参与训练的参数）
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+
+def move_optimizer_state_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
+
+
+def save_training_state(path, model_state_dict, optimizer, scaler, epoch, min_val_loss, best_ckpt_info):
+    best_epoch = None
+    best_state_dict = None
+    if best_ckpt_info is not None:
+        best_epoch, _, best_state_dict = best_ckpt_info
+
+    payload = {
+        'epoch': int(epoch),
+        'model_state_dict': model_state_dict,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scaler_state_dict': scaler.state_dict(),
+        'best_val_loss': float(min_val_loss),
+        'best_epoch': int(best_epoch) if best_epoch is not None else None,
+        'best_state_dict': best_state_dict,
+    }
+    torch.save(payload, path)
+
+
 def eval_bc(config, ckpt_name, save_episode=True):
     set_seed(1000)
     ckpt_dir = config['ckpt_dir']
@@ -507,23 +533,6 @@ def train_bc(train_dataloader, val_dataloader, config):
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
-    if resume_ckpt:
-        if not os.path.exists(resume_ckpt):
-            raise FileNotFoundError(f"resume_ckpt not found: {resume_ckpt}")
-        ckpt_obj = torch.load(resume_ckpt, map_location='cpu')
-        if isinstance(ckpt_obj, dict):
-            if 'model_state_dict' in ckpt_obj:
-                model_state = ckpt_obj['model_state_dict']
-            elif 'state_dict' in ckpt_obj:
-                model_state = ckpt_obj['state_dict']
-            else:
-                model_state = ckpt_obj
-        else:
-            model_state = ckpt_obj
-        load_status = policy.load_state_dict(model_state, strict=True)
-        if is_main:
-            print(f"[Resume] Loaded checkpoint: {resume_ckpt}")
-            print(f"[Resume] load_state_dict status: {load_status}")
     optimizer = make_optimizer(policy_class, policy)
     policy.cuda()
     if distributed:
@@ -542,8 +551,58 @@ def train_bc(train_dataloader, val_dataloader, config):
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
-    
-    epoch_iter = tqdm(range(num_epochs)) if is_main else range(num_epochs)
+    start_epoch = 0
+
+    if resume_ckpt:
+        if not os.path.exists(resume_ckpt):
+            raise FileNotFoundError(f"resume_ckpt not found: {resume_ckpt}")
+
+        ckpt_obj = torch.load(resume_ckpt, map_location='cpu')
+        if isinstance(ckpt_obj, dict):
+            if 'model_state_dict' in ckpt_obj:
+                model_state = ckpt_obj['model_state_dict']
+            elif 'state_dict' in ckpt_obj:
+                model_state = ckpt_obj['state_dict']
+            else:
+                model_state = ckpt_obj
+        else:
+            model_state = ckpt_obj
+
+        model_to_load = policy.module if hasattr(policy, "module") else policy
+        load_status = model_to_load.load_state_dict(model_state, strict=True)
+
+        if isinstance(ckpt_obj, dict) and 'optimizer_state_dict' in ckpt_obj:
+            optimizer.load_state_dict(ckpt_obj['optimizer_state_dict'])
+            model_device = next((policy.module if hasattr(policy, "module") else policy).parameters()).device
+            move_optimizer_state_to_device(optimizer, model_device)
+        if isinstance(ckpt_obj, dict) and 'scaler_state_dict' in ckpt_obj:
+            scaler.load_state_dict(ckpt_obj['scaler_state_dict'])
+        if isinstance(ckpt_obj, dict) and ckpt_obj.get('epoch') is not None:
+            start_epoch = int(ckpt_obj['epoch']) + 1
+        if isinstance(ckpt_obj, dict) and ckpt_obj.get('best_val_loss') is not None:
+            min_val_loss = float(ckpt_obj['best_val_loss'])
+        if isinstance(ckpt_obj, dict) and ckpt_obj.get('best_state_dict') is not None:
+            best_epoch = ckpt_obj.get('best_epoch')
+            if best_epoch is None:
+                best_epoch = max(0, start_epoch - 1)
+            best_ckpt_info = (
+                int(best_epoch),
+                float(min_val_loss),
+                ckpt_obj['best_state_dict'],
+            )
+
+        if is_main:
+            print(f"[Resume] Loaded checkpoint: {resume_ckpt}")
+            print(f"[Resume] load_state_dict status: {load_status}")
+            print(f"[Resume] start_epoch={start_epoch}, min_val_loss={min_val_loss:.6f}")
+
+    if start_epoch >= num_epochs:
+        if is_main:
+            print(f"[Resume] start_epoch={start_epoch} >= num_epochs={num_epochs}, nothing to train.")
+        model_to_save = policy.module if hasattr(policy, "module") else policy
+        return (start_epoch - 1, min_val_loss, deepcopy(model_to_save.state_dict()))
+
+    epoch_iter = tqdm(range(start_epoch, num_epochs)) if is_main else range(start_epoch, num_epochs)
     for epoch in epoch_iter:
         if distributed and isinstance(train_dataloader.sampler, DistributedSampler):
             train_dataloader.sampler.set_epoch(epoch)
@@ -662,6 +721,16 @@ def train_bc(train_dataloader, val_dataloader, config):
             model_to_save = policy.module if hasattr(policy, "module") else policy
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(model_to_save.state_dict(), ckpt_path)
+            state_path = os.path.join(ckpt_dir, f'train_state_epoch_{epoch}_seed_{seed}.pt')
+            save_training_state(
+                state_path,
+                model_to_save.state_dict(),
+                optimizer,
+                scaler,
+                epoch,
+                min_val_loss,
+                best_ckpt_info,
+            )
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
     if not is_main:
@@ -670,6 +739,16 @@ def train_bc(train_dataloader, val_dataloader, config):
     model_to_save = policy.module if hasattr(policy, "module") else policy
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
     torch.save(model_to_save.state_dict(), ckpt_path)
+    state_path = os.path.join(ckpt_dir, f'train_state_last.pt')
+    save_training_state(
+        state_path,
+        model_to_save.state_dict(),
+        optimizer,
+        scaler,
+        num_epochs - 1,
+        min_val_loss,
+        best_ckpt_info,
+    )
 
     if best_ckpt_info is None:
         best_ckpt_info = (num_epochs - 1, float('inf'), deepcopy(model_to_save.state_dict()))
