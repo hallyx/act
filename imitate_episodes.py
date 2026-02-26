@@ -28,6 +28,11 @@ from sim_env import BOX_POSE
 import IPython
 e = IPython.embed
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
+
 def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
@@ -54,7 +59,7 @@ def build_ddp_dataloaders(train_dataloader, val_dataloader, batch_size_train, ba
     val_dataset = val_dataloader.dataset
 
     train_workers = max(0, int(num_workers))
-    # 验证阶段不需要并行加载，避免 train/val 两套 worker 同时占用内存导致 OOM
+    # 楠岃瘉闃舵涓嶉渶瑕佸苟琛屽姞杞斤紝閬垮厤 train/val 涓ゅ worker 鍚屾椂鍗犵敤鍐呭瓨瀵艰嚧 OOM
     val_workers = 0
 
     train_sampler = DistributedSampler(
@@ -74,7 +79,7 @@ def build_ddp_dataloaders(train_dataloader, val_dataloader, batch_size_train, ba
         persistent_workers=False,
     )
     if train_workers > 0:
-        # 降低预取深度，减少每个 worker 的队列缓存占用
+        # 闄嶄綆棰勫彇娣卞害锛屽噺灏戞瘡涓?worker 鐨勯槦鍒楃紦瀛樺崰鐢?
         train_loader_kwargs["prefetch_factor"] = 1
 
     val_loader_kwargs = dict(
@@ -123,7 +128,7 @@ def finalize_running_stats(running_stats, count):
 
 @record
 def main(args):
-    #os.environ["CUDA_VISIBLE_DEVICES"] = "1" # 指定使用 GPU 1,第二张卡，不需要时注释掉
+    #os.environ["CUDA_VISIBLE_DEVICES"] = "1" # 鎸囧畾浣跨敤 GPU 1,绗簩寮犲崱锛屼笉闇€瑕佹椂娉ㄩ噴鎺?
     distributed, rank, world_size, local_rank = setup_distributed()
     is_main = rank == 0
 
@@ -137,17 +142,19 @@ def main(args):
     batch_size_train = args['batch_size']
     batch_size_val = args['batch_size']
     num_epochs = args['num_epochs']
-    num_obs = args.get('num_obs', 1)  # 获取观测窗口大小，默认为1
+    num_obs = args.get('num_obs', 1)  # 鑾峰彇瑙傛祴绐楀彛澶у皬锛岄粯璁や负1
     loader_mode = args.get('loader_mode', 'full_episode')
     sliding_stride = args.get('sliding_stride', 1)
     dataloader_workers = args.get('dataloader_workers', 1)
+    preload_to_memory = args.get('preload_to_memory', False)
+    val_interval = max(1, int(args.get('val_interval', 1)))
     chunk_size = args['chunk_size'] if args.get('chunk_size') is not None else 50
     
     # get task parameters
     is_sim = 'True'
     from constants import SIM_TASK_CONFIGS
     
-    # 不管任务名叫什么，都从本地 SIM_TASK_CONFIGS 里读
+    # 涓嶇浠诲姟鍚嶅彨浠€涔堬紝閮戒粠鏈湴 SIM_TASK_CONFIGS 閲岃
     task_config = SIM_TASK_CONFIGS[args['task_name']]
     #if is_sim:
     #    from constants import SIM_TASK_CONFIGS
@@ -161,8 +168,8 @@ def main(args):
     camera_names = task_config['camera_names']
 
     # fixed parameters
-    state_dim = 17  # 关节位置(8) + 基座位置(3) + 基座速度(6) = 17维
-    action_dim = 16  # 关节位置(7) + 夹爪(1)+速度(7) + 夹爪速度(1) = 16维
+    state_dim = 17  # 鍏宠妭浣嶇疆(8) + 鍩哄骇浣嶇疆(3) + 鍩哄骇閫熷害(6) = 17缁?
+    action_dim = 16  # 鍏宠妭浣嶇疆(7) + 澶圭埅(1)+閫熷害(7) + 澶圭埅閫熷害(1) = 16缁?
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -203,7 +210,8 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        'val_interval': val_interval,
     }
 
     config.update({
@@ -233,14 +241,16 @@ def main(args):
     # Data Loading
     if args.get('mixed_data', False):
         from utils import load_mixed_data
-        # 注意：这里 dataset_dir 通常是 './data'
+        # 娉ㄦ剰锛氳繖閲?dataset_dir 閫氬父鏄?'./data'
         train_dataloader, val_dataloader, stats, _ = load_mixed_data(
             dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
-            loader_mode=loader_mode, chunk_size=chunk_size, stride=sliding_stride, num_workers=dataloader_workers)
+            loader_mode=loader_mode, chunk_size=chunk_size, stride=sliding_stride,
+            num_workers=dataloader_workers, preload_to_memory=preload_to_memory)
     else:
         train_dataloader, val_dataloader, stats, _ = load_data(
             dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
-            loader_mode=loader_mode, chunk_size=chunk_size, stride=sliding_stride, num_workers=dataloader_workers)
+            loader_mode=loader_mode, chunk_size=chunk_size, stride=sliding_stride,
+            num_workers=dataloader_workers, preload_to_memory=preload_to_memory)
 
     if distributed:
         train_dataloader, val_dataloader = build_ddp_dataloaders(
@@ -302,7 +312,7 @@ def get_image(ts, camera_names):
     return curr_image
 
 def count_parameters(model):
-    # 计算所有 requires_grad=True 的参数（即参与训练的参数）
+    # 璁＄畻鎵€鏈?requires_grad=True 鐨勫弬鏁帮紙鍗冲弬涓庤缁冪殑鍙傛暟锛?
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def eval_bc(config, ckpt_name, save_episode=True):
@@ -475,15 +485,15 @@ def eval_bc(config, ckpt_name, save_episode=True):
 def forward_pass(data, policy):
     image_data, qpos_data, action_data, is_pad = data
     
-    # === 修改：强制加 .float() 转换数据类型 ===
-    image_data = image_data.cuda().float()
-    qpos_data = qpos_data.cuda().float()   # <--- 关键修改：转为 float32
-    action_data = action_data.cuda().float() # <--- 保险起见，这也加上
-    is_pad = is_pad.cuda()
+    # === 淇敼锛氬己鍒跺姞 .float() 杞崲鏁版嵁绫诲瀷 ===
+    image_data = image_data.cuda(non_blocking=True).float()
+    qpos_data = qpos_data.cuda(non_blocking=True).float()   # <--- 鍏抽敭淇敼锛氳浆涓?float32
+    action_data = action_data.cuda(non_blocking=True).float() # <--- 淇濋櫓璧疯锛岃繖涔熷姞涓?
+    is_pad = is_pad.cuda(non_blocking=True)
 
-    # 处理新的数据格式：从 (batch, num_obs, num_cam, C, H, W) -> (batch, num_cam, C, H, W)
-    #                  和 (batch, num_obs, state_dim) -> (batch, state_dim)
-    # 当 num_obs=1 时，squeeze 掉 num_obs 维度以保持向后兼容性
+    # 澶勭悊鏂扮殑鏁版嵁鏍煎紡锛氫粠 (batch, num_obs, num_cam, C, H, W) -> (batch, num_cam, C, H, W)
+    #                  鍜?(batch, num_obs, state_dim) -> (batch, state_dim)
+    # 褰?num_obs=1 鏃讹紝squeeze 鎺?num_obs 缁村害浠ヤ繚鎸佸悜鍚庡吋瀹规€?
     if image_data.ndim == 6:
         image_data = image_data.squeeze(1)  # (batch, num_cam, C, H, W)
     if qpos_data.ndim == 3:
@@ -500,6 +510,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     distributed = config.get('distributed', False)
     local_rank = config.get('local_rank', 0)
     is_main = config.get('is_main', True)
+    val_interval = max(1, int(config.get('val_interval', 1)))
 
     set_seed(seed)
 
@@ -515,7 +526,7 @@ def train_bc(train_dataloader, val_dataloader, config):
             broadcast_buffers=False,
         )
     
-    # 开启混合精度训练 (AMP)
+    # 寮€鍚贩鍚堢簿搴﹁缁?(AMP)
     scaler = torch.cuda.amp.GradScaler()
 
     train_history = []
@@ -532,51 +543,53 @@ def train_bc(train_dataloader, val_dataloader, config):
             print(f'\n{"="*60}\nEpoch {epoch}\n{"="*60}')
         
         # validation
-        val_start_time = time.time()
-        if is_main:
-            print(f"开始验证... (共 {len(val_dataloader)} 个batch)")
-        with torch.no_grad():
-            policy.eval()
-            running_val_stats = None
-            val_count = 0
-            for batch_idx, data in enumerate(val_dataloader):
-                t_forward = time.time()
-                with torch.cuda.amp.autocast():
-                    forward_dict = forward_pass(data, policy)
-                log_timing("10_val_forward_pass", time.time() - t_forward)
-                if running_val_stats is None:
-                    running_val_stats = init_running_stats(forward_dict.keys())
-                update_running_stats(running_val_stats, forward_dict)
-                val_count += 1
-                
-                # 清理中间变量减少内存占用
-                del data, forward_dict
-                # if batch_idx % 200 == 0:  # 减少清理频率
-                #     torch.cuda.empty_cache()
-                # 显示进度
-                if is_main and (batch_idx % 100 == 0 or batch_idx == len(val_dataloader) - 1):
-                    elapsed = time.time() - val_start_time
-                    progress = (batch_idx + 1) / len(val_dataloader) * 100
-                    print(f"  验证进度: {batch_idx+1}/{len(val_dataloader)} ({progress:.1f}%) - 已耗时: {elapsed:.1f}s")
-            epoch_summary = finalize_running_stats(running_val_stats, val_count)
-            epoch_summary = reduce_epoch_summary(epoch_summary, device=torch.device("cuda", local_rank), distributed=distributed)
-            validation_history.append(epoch_summary)
+        val_time = 0.0
+        should_validate = (epoch % val_interval == 0) or (epoch == num_epochs - 1)
+        if should_validate:
+            val_start_time = time.time()
+            if is_main:
+                print(f"Start validation... (total {len(val_dataloader)} batches)")
+            with torch.no_grad():
+                policy.eval()
+                running_val_stats = None
+                val_count = 0
+                for batch_idx, data in enumerate(val_dataloader):
+                    t_forward = time.time()
+                    with torch.cuda.amp.autocast():
+                        forward_dict = forward_pass(data, policy)
+                    log_timing("10_val_forward_pass", time.time() - t_forward)
+                    if running_val_stats is None:
+                        running_val_stats = init_running_stats(forward_dict.keys())
+                    update_running_stats(running_val_stats, forward_dict)
+                    val_count += 1
 
-            epoch_val_loss = epoch_summary['loss']
-            if is_main and epoch_val_loss < min_val_loss:
-                min_val_loss = epoch_val_loss
-                model_to_save = policy.module if hasattr(policy, "module") else policy
-                best_ckpt_info = (epoch, min_val_loss, deepcopy(model_to_save.state_dict()))
-            # 清理验证阶段的内存
-            del running_val_stats
-            torch.cuda.empty_cache()
-        val_time = time.time() - val_start_time
-        if is_main:
-            print(f'Val loss:   {epoch_val_loss:.5f} (耗时: {val_time:.1f}s)')
-            summary_string = ''
-            for k, v in epoch_summary.items():
-                summary_string += f'{k}: {v.item():.3f} '
-            print(summary_string)
+                    del data, forward_dict
+                    if is_main and (batch_idx % 100 == 0 or batch_idx == len(val_dataloader) - 1):
+                        elapsed = time.time() - val_start_time
+                        progress = (batch_idx + 1) / len(val_dataloader) * 100
+                        print(f"  Val progress: {batch_idx+1}/{len(val_dataloader)} ({progress:.1f}%) - elapsed: {elapsed:.1f}s")
+
+                epoch_summary = finalize_running_stats(running_val_stats, val_count)
+                epoch_summary = reduce_epoch_summary(epoch_summary, device=torch.device("cuda", local_rank), distributed=distributed)
+                validation_history.append(epoch_summary)
+
+                epoch_val_loss = epoch_summary['loss']
+                if is_main and epoch_val_loss < min_val_loss:
+                    min_val_loss = epoch_val_loss
+                    model_to_save = policy.module if hasattr(policy, "module") else policy
+                    best_ckpt_info = (epoch, min_val_loss, deepcopy(model_to_save.state_dict()))
+
+                del running_val_stats
+                torch.cuda.empty_cache()
+            val_time = time.time() - val_start_time
+            if is_main:
+                print(f'Val loss:   {epoch_val_loss:.5f} (time: {val_time:.1f}s)')
+                summary_string = ''
+                for k, v in epoch_summary.items():
+                    summary_string += f'{k}: {v.item():.3f} '
+                print(summary_string)
+        elif is_main:
+            print(f'Skip validation this epoch (val_interval={val_interval})')
 
         # training
         train_start_time = time.time()
@@ -609,9 +622,9 @@ def train_bc(train_dataloader, val_dataloader, config):
             update_running_stats(running_train_stats, forward_dict)
             train_count += 1
 
-            # 清理中间变量
+            # 娓呯悊涓棿鍙橀噺
             del data, forward_dict, loss
-            # 大幅减少 empty_cache 频率，这在 4090 上非常耗时，仅在内存压力极大时使用
+            # 澶у箙鍑忓皯 empty_cache 棰戠巼锛岃繖鍦?4090 涓婇潪甯歌€楁椂锛屼粎鍦ㄥ唴瀛樺帇鍔涙瀬澶ф椂浣跨敤
             # if batch_idx % 500 == 0: 
             #     torch.cuda.empty_cache()
                 
@@ -620,7 +633,7 @@ def train_bc(train_dataloader, val_dataloader, config):
         epoch_train_loss = epoch_summary['loss']
         train_time = time.time() - train_start_time
         if is_main:
-            print(f'Train loss: {epoch_train_loss:.5f} (耗时: {train_time:.1f}s)')
+            print(f'Train loss: {epoch_train_loss:.5f} (鑰楁椂: {train_time:.1f}s)')
             summary_string = ''
             for k, v in epoch_summary.items():
                 summary_string += f'{k}: {v.item():.3f} '
@@ -628,15 +641,15 @@ def train_bc(train_dataloader, val_dataloader, config):
             train_history.append(epoch_summary)
         del running_train_stats
         
-        # 每个epoch结束后强制垃圾回收
+        # 姣忎釜epoch缁撴潫鍚庡己鍒跺瀮鍦惧洖鏀?
         gc.collect()
         torch.cuda.empty_cache()
         
         epoch_total_time = time.time() - epoch_start_time
         if is_main:
-            print(f'Epoch {epoch} 总耗时: {epoch_total_time:.1f}s (验证:{val_time:.1f}s + 训练:{train_time:.1f}s)')
+            print(f'Epoch {epoch} 鎬昏€楁椂: {epoch_total_time:.1f}s (楠岃瘉:{val_time:.1f}s + 璁粌:{train_time:.1f}s)')
         
-        # 每10个epoch打印一次详细统计并保存模型
+        # 姣?0涓猠poch鎵撳嵃涓€娆¤缁嗙粺璁″苟淇濆瓨妯″瀷
         if is_main and epoch % 10 == 0:
             print_timing_stats()
             model_to_save = policy.module if hasattr(policy, "module") else policy
@@ -700,7 +713,7 @@ if __name__ == '__main__':
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
     parser.add_argument('--num_obs', action='store', type=int, default=1, help='num_obs', required=False)
-    parser.add_argument('--mixed_data', action='store_true',default=True, help='Use mixed data from multiple folders')
+    parser.add_argument('--mixed_data', action='store_true',default=False, help='Use mixed data from multiple folders')
     parser.add_argument('--loader_mode', action='store', type=str, default='full_episode',
                         choices=['full_episode', 'sliding_window'],
                         help='Data loading mode for training samples')
@@ -708,6 +721,10 @@ if __name__ == '__main__':
                         help='Stride used when loader_mode=sliding_window')
     parser.add_argument('--dataloader_workers', action='store', type=int, default=1,
                         help='DataLoader num_workers')
+    parser.add_argument('--val_interval', action='store', type=int, default=1,
+                        help='Run validation every N epochs (always runs at final epoch)')
+    parser.add_argument('--preload_to_memory', action='store_true',
+                        help='Preload full episodes (decoded images + states + actions) into RAM before training')
     
     try:
         main(vars(parser.parse_args()))

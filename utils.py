@@ -59,7 +59,7 @@ def find_all_hdf5(dataset_dir):
     return filtered_paths
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, file_paths, camera_names, norm_stats, loader_mode='full_episode', chunk_size=50, stride=1, random_start=True):
+    def __init__(self, file_paths, camera_names, norm_stats, loader_mode='full_episode', chunk_size=50, stride=1, random_start=True, preload_to_memory=False):
         super(EpisodicDataset).__init__()
         self.file_paths = file_paths
         self.camera_names = camera_names
@@ -68,8 +68,15 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.chunk_size = int(chunk_size)
         self.stride = int(stride)
         self.random_start = random_start
+        self.preload_to_memory = bool(preload_to_memory)
         self.is_sim = None
         self.sample_index = []
+        self.episodes_cache = []
+        self.episode_lengths = []
+        self.action_mean_t = torch.as_tensor(self.norm_stats["action_mean"], dtype=torch.float32)
+        self.action_std_t = torch.as_tensor(self.norm_stats["action_std"], dtype=torch.float32)
+        self.qpos_mean_t = torch.as_tensor(self.norm_stats["qpos_mean"], dtype=torch.float32)
+        self.qpos_std_t = torch.as_tensor(self.norm_stats["qpos_std"], dtype=torch.float32)
 
         if self.loader_mode not in ['full_episode', 'sliding_window']:
             raise ValueError(f"Invalid loader_mode={self.loader_mode}. Use 'full_episode' or 'sliding_window'.")
@@ -81,16 +88,85 @@ class EpisodicDataset(torch.utils.data.Dataset):
         if len(self.file_paths) == 0:
             raise ValueError("No file_paths provided to EpisodicDataset.")
 
+        if self.preload_to_memory:
+            self._preload_all_episodes()
+        else:
+            self._index_from_files()
+
         if self.loader_mode == 'sliding_window':
             print(f"Indexing {len(self.file_paths)} episodes... (mode={self.loader_mode}, chunk={self.chunk_size}, stride={self.stride})")
-            for file_idx, file_path in enumerate(self.file_paths):
-                with h5py.File(file_path, 'r') as root:
-                    episode_len = root['/action/joint_positions'].shape[0]
+            for file_idx, episode_len in enumerate(self.episode_lengths):
                 for start_ts in range(0, episode_len, self.stride):
                     self.sample_index.append((file_idx, start_ts))
             print(f"Total samples indexed: {len(self.sample_index)}")
 
         self.__getitem__(0)  # initialize self.is_sim
+
+    def _index_from_files(self):
+        self.episode_lengths = []
+        for file_path in self.file_paths:
+            with h5py.File(file_path, 'r') as root:
+                self.episode_lengths.append(root['/action/joint_positions'].shape[0])
+
+    def _preload_all_episodes(self):
+        print(f"Preloading {len(self.file_paths)} episodes into RAM...")
+        q_left_index = [0, 2, 4, 6, 8, 10, 12]
+        self.episodes_cache = []
+        self.episode_lengths = []
+        total_frames = 0
+        for file_idx, dataset_path in enumerate(self.file_paths):
+            with h5py.File(dataset_path, 'r') as root:
+                self.is_sim = True
+                episode_len = root['/action/joint_positions'].shape[0]
+                self.episode_lengths.append(episode_len)
+                total_frames += episode_len
+
+                base_pose = root['/observations/base_pose'][()]
+                base_pos = base_pose[:, :3]
+                base_vel = root['/observations/base_vel'][()]
+                full_qos = root['/observations/joint_pos'][()]
+                qpos_gripper = np.zeros((episode_len, 1), dtype=np.float32)
+                joint_qpos = np.concatenate([full_qos[:, q_left_index], qpos_gripper], axis=1)
+                qpos_seq = np.concatenate([joint_qpos, base_pos, base_vel], axis=1).astype(np.float32)
+                qpos_seq_t = torch.from_numpy(qpos_seq)
+                qpos_seq_norm = (qpos_seq_t - self.qpos_mean_t) / self.qpos_std_t
+
+                cam_image_seqs = []
+                for cam_name in self.camera_names:
+                    cam_imgs = []
+                    for t in range(episode_len):
+                        img_bytes = root[f'/observations/{cam_name}'][t]
+                        img_bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+                        cam_imgs.append(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+                    cam_image_seqs.append(np.stack(cam_imgs, axis=0))
+                # (T, K, H, W, C) -> (T, K, C, H, W), keep uint8 to save RAM.
+                image_seq = np.stack(cam_image_seqs, axis=1)
+                image_seq_t = torch.from_numpy(image_seq).permute(0, 1, 4, 2, 3).contiguous()
+
+                action_joints_full = root['/action/joint_positions'][()]
+                action_joints = action_joints_full[:, q_left_index]
+                action_joints_vel_full = root['/action/joint_velocities'][()]
+                action_joints_vel = action_joints_vel_full[:, q_left_index]
+                action_gripper_full = root['/action/gripper_command'][()]
+                action_gripper = action_gripper_full[:, 0:1]
+                action_gripper_vel = action_gripper_full[:, 0:1]
+                action_seq = np.concatenate(
+                    [action_joints, action_gripper, action_joints_vel, action_gripper_vel], axis=-1
+                ).astype(np.float32)
+                action_seq_t = torch.from_numpy(action_seq)
+                action_seq_norm = (action_seq_t - self.action_mean_t) / self.action_std_t
+
+                self.episodes_cache.append(
+                    {
+                        "qpos_seq_norm": qpos_seq_norm,
+                        "image_seq": image_seq_t,
+                        "action_seq_norm": action_seq_norm,
+                        "episode_len": episode_len,
+                    }
+                )
+            if (file_idx + 1) % 20 == 0 or file_idx + 1 == len(self.file_paths):
+                print(f"  Preloaded {file_idx + 1}/{len(self.file_paths)} episodes")
+        print(f"Preload done. Total frames: {total_frames}")
 
     def __len__(self):
         if self.loader_mode == 'sliding_window':
@@ -100,52 +176,76 @@ class EpisodicDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         if self.loader_mode == 'sliding_window':
             file_idx, start_ts = self.sample_index[index]
-            dataset_path = self.file_paths[file_idx]
         else:
-            dataset_path = self.file_paths[index]
+            file_idx = index
             start_ts = None
 
-        with h5py.File(dataset_path, 'r') as root:
-            self.is_sim = True
-            original_action_shape = root['/action/joint_positions'].shape
-            episode_len = original_action_shape[0]
-
+        if self.preload_to_memory:
+            episode = self.episodes_cache[file_idx]
+            episode_len = episode["episode_len"]
             if start_ts is None:
                 if self.random_start:
                     start_ts = np.random.randint(episode_len)
                 else:
                     start_ts = 0
-
-            base_pose = root['/observations/base_pose'][start_ts]
-            base_pos = base_pose[:3]
-            base_vel = root['/observations/base_vel'][start_ts]
-            full_qos = root['/observations/joint_pos'][start_ts]
-            q_left_index = [0,2,4,6,8,10,12]
-            qpos_gripper = np.array([0.0])
-            joint_qpos = np.concatenate([full_qos[q_left_index], qpos_gripper])
-            qpos = np.concatenate([joint_qpos, base_pos, base_vel])
-
-            image_dict = dict()
-            for cam_name in self.camera_names:
-                img_bytes = root[f'/observations/{cam_name}'][start_ts]
-                img_bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-                image_dict[cam_name] = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
-            action_joints_full = root['/action/joint_positions'][start_ts:]
-            action_joints = action_joints_full[:, q_left_index]
-            action_joints_vel_full = root['/action/joint_velocities'][start_ts:]
-            action_joints_vel = action_joints_vel_full[:, q_left_index]
-            action_gripper_full = root['/action/gripper_command'][start_ts:]
-            action_gripper = action_gripper_full[:, 0:1]
-            action_gripper_vel = action_gripper_full[:, 0:1]
-            action = np.concatenate([action_joints, action_gripper, action_joints_vel, action_gripper_vel], axis=-1)
-
+            qpos_data = episode["qpos_seq_norm"][start_ts]
+            image_data = episode["image_seq"][start_ts].float() / 255.0
+            action_seq_norm = episode["action_seq_norm"][start_ts:]
             if self.loader_mode == 'sliding_window':
                 target_len = self.chunk_size
             else:
-                target_len = original_action_shape[0]
+                target_len = episode_len
+            action_len = min(action_seq_norm.shape[0], target_len)
+            action_data = torch.zeros((target_len, action_seq_norm.shape[-1]), dtype=torch.float32)
+            if action_len > 0:
+                action_data[:action_len] = action_seq_norm[:action_len]
+            is_pad = torch.ones(target_len, dtype=torch.bool)
+            is_pad[:action_len] = False
+            return image_data, qpos_data, action_data, is_pad
+        else:
+            dataset_path = self.file_paths[file_idx]
+            with h5py.File(dataset_path, 'r') as root:
+                self.is_sim = True
+                original_action_shape = root['/action/joint_positions'].shape
+                episode_len = original_action_shape[0]
 
-            action_len = min(action.shape[0], target_len)
+                if start_ts is None:
+                    if self.random_start:
+                        start_ts = np.random.randint(episode_len)
+                    else:
+                        start_ts = 0
+
+                base_pose = root['/observations/base_pose'][start_ts]
+                base_pos = base_pose[:3]
+                base_vel = root['/observations/base_vel'][start_ts]
+                full_qos = root['/observations/joint_pos'][start_ts]
+                q_left_index = [0,2,4,6,8,10,12]
+                qpos_gripper = np.array([0.0])
+                joint_qpos = np.concatenate([full_qos[q_left_index], qpos_gripper])
+                qpos = np.concatenate([joint_qpos, base_pos, base_vel])
+
+                image_dict = dict()
+                for cam_name in self.camera_names:
+                    img_bytes = root[f'/observations/{cam_name}'][start_ts]
+                    img_bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+                    image_dict[cam_name] = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+                action_joints_full = root['/action/joint_positions'][start_ts:]
+                action_joints = action_joints_full[:, q_left_index]
+                action_joints_vel_full = root['/action/joint_velocities'][start_ts:]
+                action_joints_vel = action_joints_vel_full[:, q_left_index]
+                action_gripper_full = root['/action/gripper_command'][start_ts:]
+                action_gripper = action_gripper_full[:, 0:1]
+                action_gripper_vel = action_gripper_full[:, 0:1]
+                action = np.concatenate([action_joints, action_gripper, action_joints_vel, action_gripper_vel], axis=-1)
+
+                if self.loader_mode == 'sliding_window':
+                    target_len = self.chunk_size
+                else:
+                    target_len = original_action_shape[0]
+
+        # non-preload branch only
+        action_len = min(action.shape[0], target_len)
 
         padded_action = np.zeros((target_len, action.shape[-1]), dtype=np.float32)
         padded_action[:action_len] = action[:action_len]
@@ -235,7 +335,7 @@ def get_norm_stats(file_paths, num_episodes):
     return stats
 
 
-def load_mixed_data(data_root, num_episodes, camera_names, batch_size_train, batch_size_val, loader_mode='full_episode', chunk_size=50, stride=1, num_workers=1):
+def load_mixed_data(data_root, num_episodes, camera_names, batch_size_train, batch_size_val, loader_mode='full_episode', chunk_size=50, stride=1, num_workers=1, preload_to_memory=False):
     """
     随机在 data_ik 和 data_ja 下各抽取或随机抽取两个子文件夹，
     并从每个文件夹中随机抽取 50% 的文件进行混合训练。
@@ -293,13 +393,19 @@ def load_mixed_data(data_root, num_episodes, camera_names, batch_size_train, bat
     # 计算统计值
     norm_stats = get_norm_stats(train_paths, num_episodes=num_episodes)
 
+    if preload_to_memory and os.name == 'nt' and num_workers > 0:
+        print(f"[WARN] preload_to_memory=True with num_workers={num_workers} on Windows may duplicate RAM per worker.")
+        print("[WARN] Consider setting --dataloader_workers 0 or 1 when preloading to memory.")
+
     train_dataset = EpisodicDataset(
         train_paths, camera_names, norm_stats,
-        loader_mode=loader_mode, chunk_size=chunk_size, stride=stride, random_start=(loader_mode == 'full_episode')
+        loader_mode=loader_mode, chunk_size=chunk_size, stride=stride, random_start=(loader_mode == 'full_episode'),
+        preload_to_memory=preload_to_memory
     )
     val_dataset = EpisodicDataset(
         val_paths, camera_names, norm_stats,
-        loader_mode=loader_mode, chunk_size=chunk_size, stride=stride, random_start=False
+        loader_mode=loader_mode, chunk_size=chunk_size, stride=stride, random_start=False,
+        preload_to_memory=preload_to_memory
     )
     
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=num_workers)
@@ -307,7 +413,7 @@ def load_mixed_data(data_root, num_episodes, camera_names, batch_size_train, bat
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, loader_mode='full_episode', chunk_size=50, stride=1, num_workers=1):
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, loader_mode='full_episode', chunk_size=50, stride=1, num_workers=1, preload_to_memory=False):
     print(f'\nData from: {dataset_dir}\n')
     
     # 1. 获取所有文件的绝对路径 (包含子文件夹)
@@ -335,13 +441,19 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     # 注意：这里我们通常用所有训练数据来计算 Stats，或者取前 num_episodes 个
     norm_stats = get_norm_stats(train_paths, num_episodes=num_episodes)
 
+    if preload_to_memory and os.name == 'nt' and num_workers > 0:
+        print(f"[WARN] preload_to_memory=True with num_workers={num_workers} on Windows may duplicate RAM per worker.")
+        print("[WARN] Consider setting --dataloader_workers 0 or 1 when preloading to memory.")
+
     train_dataset = EpisodicDataset(
         train_paths, camera_names, norm_stats,
-        loader_mode=loader_mode, chunk_size=chunk_size, stride=stride, random_start=(loader_mode == 'full_episode')
+        loader_mode=loader_mode, chunk_size=chunk_size, stride=stride, random_start=(loader_mode == 'full_episode'),
+        preload_to_memory=preload_to_memory
     )
     val_dataset = EpisodicDataset(
         val_paths, camera_names, norm_stats,
-        loader_mode=loader_mode, chunk_size=chunk_size, stride=stride, random_start=False
+        loader_mode=loader_mode, chunk_size=chunk_size, stride=stride, random_start=False,
+        preload_to_memory=preload_to_memory
     )
     
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=num_workers)

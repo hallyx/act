@@ -32,7 +32,7 @@ SIM_TASK_CONFIGS = {
     },
     'astrobench_dual_arm': {
         # 你的数据根目录 (请确保路径正确)
-        'dataset_dir': '/home/gpuserver/hx/github/act/data', 
+        'dataset_dir': 'E:/huxing/github/act/data', 
         # 这里的 num_episodes 主要用于 dataloader 里的划分参考
         # 实际上我们的新 load_data 会自动读取所有文件，但保持一致比较好
         'num_episodes': 100, 

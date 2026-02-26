@@ -1,6 +1,6 @@
 import torch.nn as nn
 from torch.nn import functional as F
-import torchvision.transforms as transforms
+import torch
 
 from detr.main import build_ACT_model_and_optimizer, build_CNNMLP_model_and_optimizer
 import IPython
@@ -13,13 +13,13 @@ class ACTPolicy(nn.Module):
         self.model = model # CVAE decoder
         self.optimizer = optimizer
         self.kl_weight = args_override['kl_weight']
+        self.register_buffer("img_mean", torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 1, 3, 1, 1))
+        self.register_buffer("img_std", torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 1, 3, 1, 1))
         print(f'KL Weight {self.kl_weight}')
 
     def __call__(self, qpos, image, actions=None, is_pad=None):
         env_state = None
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-        image = normalize(image)
+        image = (image - self.img_mean) / self.img_std
         if actions is not None: # training time
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]
@@ -47,12 +47,12 @@ class CNNMLPPolicy(nn.Module):
         model, optimizer = build_CNNMLP_model_and_optimizer(args_override)
         self.model = model # decoder
         self.optimizer = optimizer
+        self.register_buffer("img_mean", torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 1, 3, 1, 1))
+        self.register_buffer("img_std", torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 1, 3, 1, 1))
 
     def __call__(self, qpos, image, actions=None, is_pad=None):
         env_state = None # TODO
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-        image = normalize(image)
+        image = (image - self.img_mean) / self.img_std
         if actions is not None: # training time
             actions = actions[:, 0]
             a_hat = self.model(qpos, image, env_state, actions)
