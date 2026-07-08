@@ -3,6 +3,7 @@ import numpy as np
 import os
 import pickle
 import argparse
+import re
 import matplotlib.pyplot as plt
 from copy import deepcopy
 from tqdm import tqdm
@@ -590,6 +591,11 @@ def train_bc(train_dataloader, val_dataloader, config):
                 float(min_val_loss),
                 ckpt_obj['best_state_dict'],
             )
+        elif start_epoch == 0:
+            # Backward-compatible resume for model-only files like policy_epoch_990_seed_0.ckpt
+            match = re.search(r'policy_epoch_(\d+)_seed_\d+\.ckpt$', os.path.basename(resume_ckpt))
+            if match:
+                start_epoch = int(match.group(1)) + 1
 
         if is_main:
             print(f"[Resume] Loaded checkpoint: {resume_ckpt}")

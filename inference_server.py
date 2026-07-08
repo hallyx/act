@@ -212,7 +212,7 @@ class ACTInferenceServer:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='inference_config.json', help='Path to inference JSON config')
+    parser.add_argument('--config', type=str, default='inference_config_old.json', help='Path to inference JSON config')
     args = parser.parse_args()
 
     cfg = load_config(args.config)

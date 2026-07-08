@@ -72,7 +72,7 @@ To train ACT:
     # Transfer Cube task
     python3 imitate_episodes.py \
     --task_name astrobench_dual_arm \
-    --ckpt_dir ./ckpt_ja_aura \
+    --ckpt_dir ./ckpt/ckpt_test \
     --policy_class ACT --kl_weight 10 --chunk_size 50 --hidden_dim 512 --batch_size 24 --dim_feedforward 3200 \
     --num_epochs 2000  --lr 1e-5 \
     --seed 0

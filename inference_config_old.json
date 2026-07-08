@@ -1,0 +1,24 @@
+{
+  "port": "5555",
+  "cuda_visible_devices": "0",
+  "ckpt_dir": "./ckpt/ckpt_ja/",
+  "task_name": "astrobench_dual_arm",
+  "camera_names": ["rgb_main", "rgb_left", "rgb_right", "rgb_under"],
+  "max_timesteps": 2000,
+  "temporal_agg_k": 0.1,
+  "policy": {
+    "policy_class": "ACT",
+    "lr": 1e-5,
+    "num_queries": 50,
+    "kl_weight": 10,
+    "hidden_dim": 512,
+    "dim_feedforward": 3200,
+    "lr_backbone": 5e-6,
+    "backbone": "resnet18",
+    "enc_layers": 4,
+    "dec_layers": 7,
+    "nheads": 8,
+    "state_dim": 17,
+    "action_dim": 16
+  }
+}
